@@ -1,6 +1,10 @@
 #include "ggml-rpc.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+
+#ifdef GGML_USE_RDMA
+#include "ggml-rpc-rdma.h"
+#endif
 #include "ggml-cpp.h"
 
 #include <cinttypes>
@@ -30,6 +34,7 @@
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
+#include <thread>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
@@ -51,8 +56,16 @@ typedef int sockfd_t;
 // cross-platform socket
 struct socket_t {
     sockfd_t fd;
+#ifdef GGML_USE_RDMA
+    std::shared_ptr<rdma_transport_t> rdma;
+#endif
     socket_t(sockfd_t fd) : fd(fd) {}
+#ifdef GGML_USE_RDMA
+    socket_t(std::shared_ptr<rdma_transport_t> r) : fd(-1), rdma(r) {}
+    bool is_rdma() const { return rdma != nullptr && rdma->connected; }
+#endif
     ~socket_t() {
+        if (fd < 0) return; // RDMA socket, no fd to close
         LOG_DBG("[%s] closing socket %d\n", __func__, this->fd);
 #ifdef _WIN32
         closesocket(this->fd);
@@ -315,6 +328,15 @@ static bool set_reuse_addr(sockfd_t sockfd) {
 }
 
 static std::shared_ptr<socket_t> socket_connect(const char * host, int port) {
+#ifdef GGML_USE_RDMA
+    if (is_rdma_enabled()) {
+        auto rdma = rdma_transport_connect_cached(host, port);
+        if (rdma) {
+            return std::make_shared<socket_t>(rdma);
+        }
+        fprintf(stderr, "RDMA: connect failed, falling back to TCP\n");
+    }
+#endif
     struct sockaddr_in addr;
     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
     auto sock_ptr = make_socket(sockfd);
@@ -353,6 +375,15 @@ static std::shared_ptr<socket_t> socket_accept(sockfd_t srv_sockfd) {
 }
 
 static std::shared_ptr<socket_t> create_server_socket(const char * host, int port) {
+#ifdef GGML_USE_RDMA
+    if (is_rdma_enabled()) {
+        auto rdma = rdma_transport_listen(host, port);
+        if (rdma) {
+            return std::make_shared<socket_t>(rdma);
+        }
+        fprintf(stderr, "RDMA: listen failed, falling back to TCP\n");
+    }
+#endif
     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
     auto sock = make_socket(sockfd);
     if (sock == nullptr) {
@@ -446,6 +477,26 @@ static bool recv_msg(sockfd_t sockfd, std::vector<uint8_t> & input) {
     return recv_data(sockfd, input.data(), size);
 }
 
+// RDMA-aware send/recv wrappers
+#ifdef GGML_USE_RDMA
+static bool send_data_sock(const std::shared_ptr<socket_t> & sock, const void * data, size_t size) {
+    if (sock->is_rdma()) return sock->rdma->send_data(data, size);
+    return send_data(sock->fd, data, size);
+}
+static bool recv_data_sock(const std::shared_ptr<socket_t> & sock, void * data, size_t size) {
+    if (sock->is_rdma()) return sock->rdma->recv_data(data, size);
+    return recv_data(sock->fd, data, size);
+}
+#else
+static bool send_data_sock(const std::shared_ptr<socket_t> & sock, const void * data, size_t size) {
+    return send_data(sock->fd, data, size);
+}
+static bool recv_data_sock(const std::shared_ptr<socket_t> & sock, void * data, size_t size) {
+    return recv_data(sock->fd, data, size);
+}
+#endif
+
+
 static bool parse_endpoint(const std::string & endpoint, std::string & host, int & port) {
     size_t pos = endpoint.find(':');
     if (pos == std::string::npos) {
@@ -460,13 +511,13 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
 // No response
 static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
     uint8_t cmd_byte = cmd;
-    if (!send_data(sock->fd, &cmd_byte, sizeof(cmd_byte))) {
+    if (!send_data_sock(sock, &cmd_byte, sizeof(cmd_byte))) {
         return false;
     }
-    if (!send_data(sock->fd, &input_size, sizeof(input_size))) {
+    if (!send_data_sock(sock, &input_size, sizeof(input_size))) {
         return false;
     }
-    if (!send_data(sock->fd, input, input_size)) {
+    if (!send_data_sock(sock, input, input_size)) {
         return false;
     }
     return true;
@@ -481,13 +532,13 @@ static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cm
     // TODO: currently the output_size is always known, do we need support for commands with variable output size?
     // even if we do, we can skip sending output_size from the server for commands with known output size
     uint64_t out_size;
-    if (!recv_data(sock->fd, &out_size, sizeof(out_size))) {
+    if (!recv_data_sock(sock, &out_size, sizeof(out_size))) {
         return false;
     }
     if (out_size != output_size) {
         return false;
     }
-    if (!recv_data(sock->fd, output, output_size)) {
+    if (!recv_data_sock(sock, output, output_size)) {
         return false;
     }
     return true;
@@ -1826,6 +1877,187 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     }
 }
 
+
+#ifdef GGML_USE_RDMA
+static void rpc_serve_client_rdma(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
+                                  std::shared_ptr<socket_t> sock) {
+    rpc_server server(backends, cache_dir);
+    uint8_t cmd;
+
+    auto tx = [&](const void *d, size_t s) -> bool { return send_data_sock(sock, d, s); };
+    auto rx = [&](void *d, size_t s) -> bool { return recv_data_sock(sock, d, s); };
+
+    auto send_msg_r = [&](const void *msg, size_t msg_size) -> bool {
+        uint64_t sz = msg_size;
+        if (!tx(&sz, sizeof(sz))) return false;
+        if (msg_size > 0 && msg) return tx(msg, msg_size);
+        return true;
+    };
+    auto recv_msg_r = [&](void *msg, size_t msg_size) -> bool {
+        uint64_t sz;
+        if (!rx(&sz, sizeof(sz))) return false;
+        if (sz != msg_size) return false;
+        if (msg_size > 0 && msg) return rx(msg, msg_size);
+        return true;
+    };
+    auto recv_msg_vec_r = [&](std::vector<uint8_t> &input) -> bool {
+        uint64_t sz;
+        if (!rx(&sz, sizeof(sz))) return false;
+        try { input.resize(sz); } catch (...) { return false; }
+        if (sz > 0) return rx(input.data(), sz);
+        return true;
+    };
+
+    if (!rx(&cmd, 1)) return;
+    if (cmd != RPC_CMD_HELLO) {
+        fprintf(stderr, "RDMA: expected HELLO\n");
+        return;
+    }
+    if (!recv_msg_r(nullptr, 0)) return;
+    rpc_msg_hello_rsp hello_rsp;
+    server.hello(hello_rsp);
+    if (!send_msg_r(&hello_rsp, sizeof(hello_rsp))) return;
+
+    while (true) {
+        if (!rx(&cmd, 1)) break;
+        if (cmd >= RPC_CMD_COUNT) {
+            fprintf(stderr, "RDMA: unknown cmd %d\n", cmd);
+            break;
+        }
+        switch (cmd) {
+            case RPC_CMD_HELLO: {
+                if (!recv_msg_r(nullptr, 0)) return;
+                rpc_msg_hello_rsp hello_rsp;
+                server.hello(hello_rsp);
+                if (!send_msg_r(&hello_rsp, sizeof(hello_rsp))) return;
+                break;
+            }
+	    case RPC_CMD_DEVICE_COUNT: {
+                if (!recv_msg_r(nullptr, 0)) return;
+                rpc_msg_device_count_rsp r; r.device_count = backends.size();
+                if (!send_msg_r(&r, sizeof(r))) return;
+                break;
+            }
+            case RPC_CMD_ALLOC_BUFFER: {
+                rpc_msg_alloc_buffer_req req;
+                if (!recv_msg_r(&req, sizeof(req))) return;
+                rpc_msg_alloc_buffer_rsp rsp;
+                if (!server.alloc_buffer(req, rsp)) return;
+                if (!send_msg_r(&rsp, sizeof(rsp))) return;
+                break;
+            }
+            case RPC_CMD_GET_ALLOC_SIZE: {
+                rpc_msg_get_alloc_size_req req;
+                if (!recv_msg_r(&req, sizeof(req))) return;
+                rpc_msg_get_alloc_size_rsp rsp;
+                if (!server.get_alloc_size(req, rsp)) return;
+                if (!send_msg_r(&rsp, sizeof(rsp))) return;
+                break;
+            }
+            case RPC_CMD_GET_ALIGNMENT: {
+                rpc_msg_get_alignment_req req;
+                if (!recv_msg_r(&req, sizeof(req))) return;
+                rpc_msg_get_alignment_rsp rsp;
+                if (!server.get_alignment(req, rsp)) return;
+                if (!send_msg_r(&rsp, sizeof(rsp))) return;
+                break;
+            }
+            case RPC_CMD_GET_MAX_SIZE: {
+                rpc_msg_get_max_size_req req;
+                if (!recv_msg_r(&req, sizeof(req))) return;
+                rpc_msg_get_max_size_rsp rsp;
+                if (!server.get_max_size(req, rsp)) return;
+                if (!send_msg_r(&rsp, sizeof(rsp))) return;
+                break;
+            }
+            case RPC_CMD_BUFFER_GET_BASE: {
+                rpc_msg_buffer_get_base_req req;
+                if (!recv_msg_r(&req, sizeof(req))) return;
+                rpc_msg_buffer_get_base_rsp rsp;
+                if (!server.buffer_get_base(req, rsp)) return;
+                if (!send_msg_r(&rsp, sizeof(rsp))) return;
+                break;
+            }
+            case RPC_CMD_FREE_BUFFER: {
+                rpc_msg_free_buffer_req req;
+                if (!recv_msg_r(&req, sizeof(req))) return;
+                if (!server.free_buffer(req)) return;
+                if (!send_msg_r(nullptr, 0)) return;
+                break;
+            }
+            case RPC_CMD_BUFFER_CLEAR: {
+                rpc_msg_buffer_clear_req req;
+                if (!recv_msg_r(&req, sizeof(req))) return;
+                if (!server.buffer_clear(req)) return;
+                if (!send_msg_r(nullptr, 0)) return;
+                break;
+            }
+            case RPC_CMD_SET_TENSOR: {
+                std::vector<uint8_t> input;
+                if (!recv_msg_vec_r(input)) return;
+                if (!server.set_tensor(input)) return;
+                break;
+            }
+            case RPC_CMD_SET_TENSOR_HASH: {
+                rpc_msg_set_tensor_hash_req req;
+                if (!recv_msg_r(&req, sizeof(req))) return;
+                rpc_msg_set_tensor_hash_rsp rsp;
+                if (!server.set_tensor_hash(req, rsp)) return;
+                if (!send_msg_r(&rsp, sizeof(rsp))) return;
+                break;
+            }
+            case RPC_CMD_INIT_TENSOR: {
+                rpc_msg_init_tensor_req req;
+                if (!recv_msg_r(&req, sizeof(req))) return;
+                if (!server.init_tensor(req)) return;
+                if (!send_msg_r(nullptr, 0)) return;
+                break;
+            }
+            case RPC_CMD_GET_TENSOR: {
+                rpc_msg_get_tensor_req req;
+                if (!recv_msg_r(&req, sizeof(req))) return;
+                std::vector<uint8_t> rsp;
+                if (!server.get_tensor(req, rsp)) return;
+                if (!send_msg_r(rsp.data(), rsp.size())) return;
+                break;
+            }
+            case RPC_CMD_COPY_TENSOR: {
+                rpc_msg_copy_tensor_req req;
+                if (!recv_msg_r(&req, sizeof(req))) return;
+                rpc_msg_copy_tensor_rsp rsp;
+                if (!server.copy_tensor(req, rsp)) return;
+                if (!send_msg_r(&rsp, sizeof(rsp))) return;
+                break;
+            }
+            case RPC_CMD_GRAPH_COMPUTE: {
+                std::vector<uint8_t> input;
+                if (!recv_msg_vec_r(input)) return;
+                if (!server.graph_compute(input)) return;
+                break;
+            }
+            case RPC_CMD_GRAPH_RECOMPUTE: {
+                rpc_msg_graph_recompute_req req;
+                if (!recv_msg_r(&req, sizeof(req))) return;
+                if (!server.graph_recompute(req)) return;
+                break;
+            }
+            case RPC_CMD_GET_DEVICE_MEMORY: {
+                rpc_msg_get_device_memory_req req;
+                if (!recv_msg_r(&req, sizeof(req))) return;
+                rpc_msg_get_device_memory_rsp rsp;
+                if (!server.get_device_memory(req, rsp)) return;
+                if (!send_msg_r(&rsp, sizeof(rsp))) return;
+                break;
+            }
+            default: {
+                fprintf(stderr, "RDMA: unknown cmd %d\n", cmd);
+                return;
+            }
+        }
+    }
+}
+#endif // GGML_USE_RDMA
+
 void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
                                    size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
     if (n_devices == 0 || devices == nullptr) {
@@ -1882,7 +2114,27 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         return;
     }
     while (true) {
-        auto client_socket = socket_accept(server_socket->fd);
+#ifdef GGML_USE_RDMA
+        if (is_rdma_enabled() && server_socket->fd < 0) {
+            fprintf(stderr, "RDMA: waiting for client...\n");
+            auto rdma_client = rdma_transport_accept(server_socket->rdma);
+            if (!rdma_client) {
+                fprintf(stderr, "RDMA: accept failed\n");
+                continue;  // don't return, keep accepting
+            }
+            auto client_socket = std::make_shared<socket_t>(rdma_client);
+            printf("Accepted RDMA client connection\n");
+            fflush(stdout);
+            // Serve in a detached thread so we can accept more clients
+            std::thread([backends, cache_dir, client_socket]() {
+                rpc_serve_client_rdma(backends, cache_dir, client_socket);
+                printf("RDMA client connection closed\n");
+                fflush(stdout);
+            }).detach();
+            continue;
+        }
+#endif
+	auto client_socket = socket_accept(server_socket->fd);
         if (client_socket == nullptr) {
             fprintf(stderr, "Failed to accept client connection\n");
             return;
