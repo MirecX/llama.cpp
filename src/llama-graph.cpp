@@ -1102,8 +1102,13 @@ ggml_tensor * llm_graph_context::build_ffn_tp(
     ggml_backend_sched_set_tensor_backend(sched, act0, get_tp_backend(0));
     ggml_backend_sched_set_tensor_backend(sched, act1, get_tp_backend(1));
 
-    // row-parallel down projection + all-reduce
-    ggml_tensor * res = build_lora_mm_tp_row(down, act0, act1);
+    // concatenate activation halves and run full down projection
+    // (row-parallel down requires ggml_cont on quantized weights which
+    //  isn't supported by all backends, e.g. CUDA can't copy mxfp4)
+    ggml_tensor * act_full = ggml_concat(ctx0, act0, act1, 0);
+    cb(act_full, "ffn_act_concat", il);
+
+    ggml_tensor * res = build_lora_mm(down, act_full);
     cb(res, "ffn_down_tp", il);
 
     return res;
