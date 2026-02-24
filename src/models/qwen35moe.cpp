@@ -119,9 +119,9 @@ ggml_tensor * llm_build_qwen35moe ::build_layer_attn(
     const int64_t n_embd_head = hparams.n_embd_head_v;
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
 
-    if (tp) {
-        return build_layer_attn_tp(inp, cur, inp_pos, sections, il);
-    }
+    // TP for attention is disabled for now: build_attn manages the KV cache
+    // internally and expects full head dimensions. Only FFN uses TP.
+    // TODO: implement TP-aware KV cache splitting
 
     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
 
