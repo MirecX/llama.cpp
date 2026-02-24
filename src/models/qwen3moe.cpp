@@ -82,8 +82,22 @@ llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_grap
                 LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
-        ggml_tensor * moe_out =
-            build_moe_ffn(cur,
+        ggml_tensor * moe_out;
+        if (tp && model.layers[il].ffn_gate_exps_tp[0]) {
+            int64_t split[2] = { model.tp_expert_split[0], model.tp_expert_split[1] };
+            moe_out = build_moe_ffn_tp(cur,
+                    model.layers[il].ffn_gate_inp,
+                    model.layers[il].ffn_up_exps_tp,
+                    model.layers[il].ffn_gate_exps_tp,
+                    model.layers[il].ffn_down_exps_tp,
+                    nullptr,
+                    n_expert, n_expert_used, split,
+                    LLM_FFN_SILU, true,
+                    false, 0.0,
+                    LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+                    il);
+        } else {
+            moe_out = build_moe_ffn(cur,
                     model.layers[il].ffn_gate_inp,
                     model.layers[il].ffn_up_exps,
                     model.layers[il].ffn_gate_exps,
@@ -94,6 +108,7 @@ llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_grap
                     false, 0.0,
                     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
                     il);
+        }
         cb(moe_out, "ffn_moe_out", il);
         cur = moe_out;
 

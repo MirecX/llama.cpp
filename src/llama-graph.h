@@ -892,6 +892,24 @@ struct llm_graph_context {
                      int   il,
              ggml_tensor * probs_in = nullptr) const;
 
+    // expert-parallel MoE TP: each device runs ggml_mul_mat_id on its local expert shards
+    ggml_tensor * build_moe_ffn_tp(
+             ggml_tensor * cur,
+             ggml_tensor * gate_inp,
+             ggml_tensor * up_exps_tp[2],
+             ggml_tensor * gate_exps_tp[2],
+             ggml_tensor * down_exps_tp[2],
+             ggml_tensor * exp_probs_b,
+                 int64_t   n_expert,
+                 int64_t   n_expert_used,
+                 int64_t   n_expert_split[2],
+         llm_ffn_op_type   type_op,
+                    bool   norm_w,
+                    bool   scale_w,
+                   float   w_scale,
+            llama_expert_gating_func_type gating_op,
+                     int   il) const;
+
     //
     // inputs
     //

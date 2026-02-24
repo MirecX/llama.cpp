@@ -83,17 +83,32 @@ llm_build_minimax_m2::llm_build_minimax_m2(const llama_model & model, const llm_
                 LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
-        cur = build_moe_ffn(cur,
-                model.layers[il].ffn_gate_inp,
-                model.layers[il].ffn_up_exps,
-                model.layers[il].ffn_gate_exps,
-                model.layers[il].ffn_down_exps,
-                model.layers[il].ffn_exp_probs_b,
-                n_expert, n_expert_used,
-                LLM_FFN_SILU, true,
-                false, 0.0,
-                (llama_expert_gating_func_type) hparams.expert_gating_func,
-                il);
+        if (tp && model.layers[il].ffn_gate_exps_tp[0]) {
+            int64_t split[2] = { model.tp_expert_split[0], model.tp_expert_split[1] };
+            cur = build_moe_ffn_tp(cur,
+                    model.layers[il].ffn_gate_inp,
+                    model.layers[il].ffn_up_exps_tp,
+                    model.layers[il].ffn_gate_exps_tp,
+                    model.layers[il].ffn_down_exps_tp,
+                    model.layers[il].ffn_exp_probs_b,
+                    n_expert, n_expert_used, split,
+                    LLM_FFN_SILU, true,
+                    false, 0.0,
+                    (llama_expert_gating_func_type) hparams.expert_gating_func,
+                    il);
+        } else {
+            cur = build_moe_ffn(cur,
+                    model.layers[il].ffn_gate_inp,
+                    model.layers[il].ffn_up_exps,
+                    model.layers[il].ffn_gate_exps,
+                    model.layers[il].ffn_down_exps,
+                    model.layers[il].ffn_exp_probs_b,
+                    n_expert, n_expert_used,
+                    LLM_FFN_SILU, true,
+                    false, 0.0,
+                    (llama_expert_gating_func_type) hparams.expert_gating_func,
+                    il);
+        }
         cb(cur, "ffn_moe_out", il);
 
         cur = ggml_add(ctx0, cur, ffn_inp);

@@ -2694,6 +2694,23 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         LLAMA_LOG_INFO("%s: tensor parallelism enabled with %zu devices\n", __func__, devices.size());
     }
 
+    // compute expert-parallel split for MoE TP
+    if (tp && hparams.n_expert > 0) {
+        // use tensor_split ratios to determine expert distribution
+        float ratio0 = 0.5f;
+        if (tensor_split != nullptr && !std::all_of(tensor_split, tensor_split + n_devices(), [](float x) { return x == 0.0f; })) {
+            float sum = tensor_split[0] + tensor_split[1];
+            if (sum > 0.0f) {
+                ratio0 = tensor_split[0] / sum;
+            }
+        }
+        const int n_exp = hparams.n_expert;
+        tp_expert_split[0] = std::max(1, (int)std::round(n_exp * ratio0));
+        tp_expert_split[1] = n_exp - tp_expert_split[0];
+        LLAMA_LOG_INFO("%s: expert-parallel TP: device 0 gets %d experts, device 1 gets %d experts\n",
+                __func__, tp_expert_split[0], tp_expert_split[1]);
+    }
+
     // build a list of buffer types for the CPU and GPU devices
     // when TP is enabled, use LAYER mode for buffer allocation (split buffer types only work
     // for same-registry multi-GPU like CUDA). The TP graph helpers handle the actual parallelism
@@ -2809,6 +2826,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     int max_n_tensors = ml.n_tensors;
     max_n_tensors += 1;         // duplicated output tensor
     max_n_tensors += n_layer*2; // duplicated rope freq tensors
+    if (tp && hparams.n_expert > 0) {
+        max_n_tensors += n_layer*6; // expert TP shards: 3 expert tensors × 2 devices
+    }
     const size_t ctx_size = ggml_tensor_overhead()*max_n_tensors;
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
@@ -3979,6 +3999,28 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
                         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
                         layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+
+                        // create expert-parallel TP shard tensors on each device
+                        if (tp) {
+                            const int64_t n0 = tp_expert_split[0];
+                            const int64_t n1 = tp_expert_split[1];
+                            for (int d = 0; d < 2; d++) {
+                                const int64_t nd = (d == 0) ? n0 : n1;
+                                auto * dev = devices[d];
+                                auto & buft_list_d = pimpl->gpu_buft_list.at(dev);
+                                auto buft = buft_list_d.front().second;
+                                auto * ctx = ctx_for_buft(buft);
+                                ggml_type gate_type = layer.ffn_gate_exps->type;
+                                ggml_type down_type = layer.ffn_down_exps->type;
+                                ggml_type up_type   = layer.ffn_up_exps->type;
+                                layer.ffn_gate_exps_tp[d] = ggml_new_tensor_3d(ctx, gate_type, n_embd,   n_ff_exp, nd);
+                                layer.ffn_down_exps_tp[d] = ggml_new_tensor_3d(ctx, down_type, n_ff_exp, n_embd,   nd);
+                                layer.ffn_up_exps_tp[d]   = ggml_new_tensor_3d(ctx, up_type,   n_embd,   n_ff_exp, nd);
+                                ggml_format_name(layer.ffn_gate_exps_tp[d], "blk.%d.ffn_gate_exps_tp.%d", i, d);
+                                ggml_format_name(layer.ffn_down_exps_tp[d], "blk.%d.ffn_down_exps_tp.%d", i, d);
+                                ggml_format_name(layer.ffn_up_exps_tp[d],   "blk.%d.ffn_up_exps_tp.%d",   i, d);
+                            }
+                        }
                     }
                 } break;
             case LLM_ARCH_PHI2:
@@ -7160,6 +7202,28 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff,   n_embd, n_expert}, 0);
                         layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff,   n_expert}, 0);
                         layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, 0);
+
+                        // create expert-parallel TP shard tensors on each device
+                        if (tp) {
+                            const int64_t n0 = tp_expert_split[0];
+                            const int64_t n1 = tp_expert_split[1];
+                            for (int d = 0; d < 2; d++) {
+                                const int64_t nd = (d == 0) ? n0 : n1;
+                                auto * dev = devices[d];
+                                auto & buft_list = pimpl->gpu_buft_list.at(dev);
+                                auto buft = buft_list.front().second;
+                                auto * ctx = ctx_for_buft(buft);
+                                ggml_type gate_type = layer.ffn_gate_exps->type;
+                                ggml_type down_type = layer.ffn_down_exps->type;
+                                ggml_type up_type   = layer.ffn_up_exps->type;
+                                layer.ffn_gate_exps_tp[d] = ggml_new_tensor_3d(ctx, gate_type, n_embd, n_ff,   nd);
+                                layer.ffn_down_exps_tp[d] = ggml_new_tensor_3d(ctx, down_type, n_ff,   n_embd, nd);
+                                layer.ffn_up_exps_tp[d]   = ggml_new_tensor_3d(ctx, up_type,   n_embd, n_ff,   nd);
+                                ggml_format_name(layer.ffn_gate_exps_tp[d], "blk.%d.ffn_gate_exps_tp.%d", i, d);
+                                ggml_format_name(layer.ffn_down_exps_tp[d], "blk.%d.ffn_down_exps_tp.%d", i, d);
+                                ggml_format_name(layer.ffn_up_exps_tp[d],   "blk.%d.ffn_up_exps_tp.%d",   i, d);
+                            }
+                        }
                     }
                 } break;
             case LLM_ARCH_KIMI_LINEAR:
@@ -7505,6 +7569,28 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), { n_embd, n_ff_exp, n_expert }, 0);
                         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), { n_ff_exp, n_embd, n_expert }, 0);
                         layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), { n_embd, n_ff_exp, n_expert }, 0);
+
+                        // create expert-parallel TP shard tensors on each device
+                        if (tp) {
+                            const int64_t n0 = tp_expert_split[0];
+                            const int64_t n1 = tp_expert_split[1];
+                            for (int d = 0; d < 2; d++) {
+                                const int64_t nd = (d == 0) ? n0 : n1;
+                                auto * dev = devices[d];
+                                auto & buft_list = pimpl->gpu_buft_list.at(dev);
+                                auto buft = buft_list.front().second;
+                                auto * ctx = ctx_for_buft(buft);
+                                ggml_type gate_type = layer.ffn_gate_exps->type;
+                                ggml_type down_type = layer.ffn_down_exps->type;
+                                ggml_type up_type   = layer.ffn_up_exps->type;
+                                layer.ffn_gate_exps_tp[d] = ggml_new_tensor_3d(ctx, gate_type, n_embd,  n_ff_exp, nd);
+                                layer.ffn_down_exps_tp[d] = ggml_new_tensor_3d(ctx, down_type, n_ff_exp, n_embd,  nd);
+                                layer.ffn_up_exps_tp[d]   = ggml_new_tensor_3d(ctx, up_type,   n_embd,  n_ff_exp, nd);
+                                ggml_format_name(layer.ffn_gate_exps_tp[d], "blk.%d.ffn_gate_exps_tp.%d", i, d);
+                                ggml_format_name(layer.ffn_down_exps_tp[d], "blk.%d.ffn_down_exps_tp.%d", i, d);
+                                ggml_format_name(layer.ffn_up_exps_tp[d],   "blk.%d.ffn_up_exps_tp.%d",   i, d);
+                            }
+                        }
 
                         // Shared experts
                         const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
@@ -7853,6 +7939,44 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
+    }
+
+    // copy expert weights from monolithic tensors to per-device TP shards
+    if (tp && hparams.n_expert > 0) {
+        LLAMA_LOG_INFO("%s: copying expert weights to TP shards...\n", __func__);
+        const int n0 = tp_expert_split[0];
+        const int n1 = tp_expert_split[1];
+
+        for (int il = 0; il < (int)hparams.n_layer; ++il) {
+            auto & layer = layers[il];
+
+            // skip layers without expert TP shards (e.g. non-MoE layers in hybrid models)
+            if (!layer.ffn_gate_exps_tp[0]) {
+                continue;
+            }
+
+            // helper: copy expert range from full tensor to shard
+            auto copy_expert_shard = [&](ggml_tensor * full, ggml_tensor * shard, int expert_start, int n_experts_shard) {
+                const size_t expert_bytes = ggml_nbytes(full) / full->ne[2]; // bytes per expert
+                const size_t src_offset = (size_t)expert_start * expert_bytes;
+                const size_t total_bytes = (size_t)n_experts_shard * expert_bytes;
+
+                std::vector<uint8_t> buf(total_bytes);
+                ggml_backend_tensor_get(full, buf.data(), src_offset, total_bytes);
+                ggml_backend_tensor_set(shard, buf.data(), 0, total_bytes);
+            };
+
+            // gate experts
+            copy_expert_shard(layer.ffn_gate_exps, layer.ffn_gate_exps_tp[0], 0,  n0);
+            copy_expert_shard(layer.ffn_gate_exps, layer.ffn_gate_exps_tp[1], n0, n1);
+            // down experts
+            copy_expert_shard(layer.ffn_down_exps, layer.ffn_down_exps_tp[0], 0,  n0);
+            copy_expert_shard(layer.ffn_down_exps, layer.ffn_down_exps_tp[1], n0, n1);
+            // up experts
+            copy_expert_shard(layer.ffn_up_exps,   layer.ffn_up_exps_tp[0],   0,  n0);
+            copy_expert_shard(layer.ffn_up_exps,   layer.ffn_up_exps_tp[1],   n0, n1);
+        }
+        LLAMA_LOG_INFO("%s: expert TP shard copy complete\n", __func__);
     }
 
     if (use_mmap_buffer) {

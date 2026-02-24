@@ -534,6 +534,7 @@ struct llama_model {
     // tensor parallelism state
     bool tp = false;  // true when split_mode==ROW and n_devices>=2
     int  tp_size = 0; // number of TP devices (0 or 2)
+    int  tp_expert_split[2] = {}; // experts per device [dev0_count, dev1_count]
 
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;

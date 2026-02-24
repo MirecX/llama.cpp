@@ -1700,6 +1700,174 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     return moe_out;
 }
 
+// expert-parallel MoE TP: each device runs ggml_mul_mat_id on its local expert shards
+ggml_tensor * llm_graph_context::build_moe_ffn_tp(
+         ggml_tensor * cur,
+         ggml_tensor * gate_inp,
+         ggml_tensor * up_exps_tp[2],
+         ggml_tensor * gate_exps_tp[2],
+         ggml_tensor * down_exps_tp[2],
+         ggml_tensor * exp_probs_b,
+             int64_t   n_expert,
+             int64_t   n_expert_used,
+             int64_t   n_expert_split[2],
+     llm_ffn_op_type   type_op,
+                bool   norm_w,
+                bool   scale_w,
+               float   w_scale,
+        llama_expert_gating_func_type gating_op,
+                 int   il) const {
+    const int64_t n_embd_cur = cur->ne[0];
+    const int64_t n_tokens   = cur->ne[1];
+    const int64_t n0 = n_expert_split[0];
+    const int64_t n1 = n_expert_split[1];
+
+    // ---- routing (on primary device, same as non-TP) ----
+    ggml_tensor * logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
+    cb(logits, "ffn_moe_logits", il);
+
+    ggml_tensor * probs = nullptr;
+    switch (gating_op) {
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:
+            probs = ggml_soft_max(ctx0, logits);
+            break;
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:
+            probs = ggml_sigmoid(ctx0, logits);
+            break;
+        default:
+            GGML_ABORT("unsupported gating op for TP MoE");
+    }
+    cb(probs, "ffn_moe_probs", il);
+
+    // add selection bias (DeepSeek V3 / MiniMax style)
+    ggml_tensor * selection_probs = probs;
+    if (exp_probs_b != nullptr) {
+        selection_probs = ggml_add(ctx0, probs, exp_probs_b);
+        cb(selection_probs, "ffn_moe_probs_biased", il);
+    }
+
+    // select top-k experts globally
+    ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+    cb(selected_experts, "ffn_moe_topk", il);
+
+    // extract weights for selected experts
+    probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
+    ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
+    cb(weights, "ffn_moe_weights", il);
+
+    if (norm_w) {
+        weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
+        ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights);
+        weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
+        weights = ggml_div(ctx0, weights, weights_sum);
+        cb(weights, "ffn_moe_weights_norm", il);
+        weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
+    }
+    if (scale_w) {
+        weights = ggml_scale(ctx0, weights, w_scale);
+    }
+
+    ggml_build_forward_expand(gf, weights);
+
+    cur = ggml_reshape_3d(ctx0, cur, n_embd_cur, 1, n_tokens);
+
+    // ---- per-device expert dispatch ----
+    // Strategy: for each device, remap global expert IDs to local shard IDs
+    // and zero out weights for experts not on that device.
+    // ggml_mul_mat_id with clamped IDs + zeroed weights = correct results.
+
+    ggml_tensor * sel_f = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32); // [n_expert_used, n_tokens]
+
+    ggml_tensor * device_results[2] = {};
+
+    for (int d = 0; d < 2; d++) {
+        const int64_t nd       = n_expert_split[d];
+        const int64_t id_start = (d == 0) ? 0  : n0;  // global ID range start
+        const int64_t id_end   = (d == 0) ? n0 : n_expert; // global ID range end (exclusive)
+
+        // remap expert IDs: subtract base, clamp to [0, nd-1]
+        // experts not on this device get clamped to 0 (but their weight will be 0)
+        ggml_tensor * local_ids_f = ggml_add(ctx0, sel_f, ggml_fill(ctx0, sel_f, -(float)id_start));
+        local_ids_f = ggml_clamp(ctx0, local_ids_f, 0.0f, (float)(nd - 1));
+        ggml_tensor * local_ids = ggml_cast(ctx0, local_ids_f, GGML_TYPE_I32);
+        ggml_format_name(local_ids, "ffn_moe_local_ids_%d", d);
+
+        // create weight mask: zero out weights for experts not on this device
+        // mask[i] = (selected_experts[i] >= id_start && selected_experts[i] < id_end) ? 1.0 : 0.0
+        // using step function with 0.5 offset to handle exact boundaries correctly
+        ggml_tensor * above_start = ggml_step(ctx0, ggml_add(ctx0, sel_f, ggml_fill(ctx0, sel_f, -(float)id_start + 0.5f)));
+        ggml_tensor * below_end   = ggml_step(ctx0, ggml_add(ctx0, ggml_scale(ctx0, sel_f, -1.0f), ggml_fill(ctx0, sel_f, (float)id_end - 0.5f)));
+        ggml_tensor * mask = ggml_mul(ctx0, above_start, below_end); // [n_expert_used, n_tokens]
+        mask = ggml_reshape_3d(ctx0, mask, 1, n_expert_used, n_tokens);
+        ggml_format_name(mask, "ffn_moe_mask_%d", d);
+
+        ggml_tensor * masked_weights = ggml_mul(ctx0, weights, mask);
+        ggml_format_name(masked_weights, "ffn_moe_weights_%d", d);
+
+        // expert FFN on this device's shards
+        // scheduler will naturally schedule mul_mat_id on the device that owns the weight tensor
+        ggml_tensor * up = build_lora_mm_id(up_exps_tp[d], cur, local_ids); // [n_ff, n_expert_used, n_tokens]
+        ggml_format_name(up, "ffn_moe_up_%d", d);
+
+        ggml_tensor * gate_out = nullptr;
+        if (gate_exps_tp[d]) {
+            gate_out = build_lora_mm_id(gate_exps_tp[d], cur, local_ids); // [n_ff, n_expert_used, n_tokens]
+            ggml_format_name(gate_out, "ffn_moe_gate_%d", d);
+        }
+
+        ggml_tensor * ffn_out = nullptr;
+        switch (type_op) {
+            case LLM_FFN_SILU:
+                if (gate_out) {
+                    ffn_out = ggml_swiglu_split(ctx0, gate_out, up);
+                } else {
+                    ffn_out = ggml_silu(ctx0, up);
+                }
+                break;
+            case LLM_FFN_GELU:
+                if (gate_out) {
+                    ffn_out = ggml_geglu_split(ctx0, gate_out, up);
+                } else {
+                    ffn_out = ggml_gelu(ctx0, up);
+                }
+                break;
+            default:
+                GGML_ABORT("unsupported activation for TP MoE");
+        }
+        ggml_format_name(ffn_out, "ffn_moe_act_%d", d);
+
+        ggml_tensor * experts_out = build_lora_mm_id(down_exps_tp[d], ffn_out, local_ids); // [n_embd, n_expert_used, n_tokens]
+        ggml_format_name(experts_out, "ffn_moe_down_%d", d);
+
+        // apply masked weights
+        experts_out = ggml_mul(ctx0, experts_out, masked_weights);
+
+        // aggregate across selected experts → [n_embd, n_tokens]
+        ggml_tensor * dev_experts[LLAMA_MAX_EXPERTS] = {};
+        for (int64_t i = 0; i < n_expert_used; ++i) {
+            dev_experts[i] = ggml_view_2d(ctx0, experts_out, n_embd_cur, n_tokens, experts_out->nb[2], i * experts_out->nb[1]);
+            ggml_build_forward_expand(gf, dev_experts[i]);
+        }
+
+        ggml_tensor * dev_out = dev_experts[0];
+        for (int64_t i = 1; i < n_expert_used; ++i) {
+            dev_out = ggml_add(ctx0, dev_out, dev_experts[i]);
+        }
+        if (n_expert_used == 1) {
+            dev_out = ggml_cont(ctx0, dev_out);
+        }
+        ggml_format_name(dev_out, "ffn_moe_dev_%d", d);
+
+        device_results[d] = dev_out;
+    }
+
+    // all-reduce: sum results from both devices
+    ggml_tensor * moe_out = ggml_add(ctx0, device_results[0], device_results[1]);
+    cb(moe_out, "ffn_moe_out", il);
+
+    return moe_out;
+}
+
 // input embeddings with optional lora
 ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     const int64_t n_embd_inp = hparams.n_embd_inp();

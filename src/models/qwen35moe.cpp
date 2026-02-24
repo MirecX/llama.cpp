@@ -486,14 +486,27 @@ ggml_tensor * llm_build_qwen35moe ::build_layer_ffn(ggml_tensor * cur, const int
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
-    // MoE routed experts — no TP for v1, run normally
-    ggml_tensor * moe_out =
-        build_moe_ffn(cur,
+    // MoE routed experts
+    ggml_tensor * moe_out;
+    if (tp && model.layers[il].ffn_gate_exps_tp[0]) {
+        int64_t split[2] = { model.tp_expert_split[0], model.tp_expert_split[1] };
+        moe_out = build_moe_ffn_tp(cur,
+            model.layers[il].ffn_gate_inp,
+            model.layers[il].ffn_up_exps_tp,
+            model.layers[il].ffn_gate_exps_tp,
+            model.layers[il].ffn_down_exps_tp,
+            nullptr,
+            n_expert, n_expert_used, split,
+            LLM_FFN_SILU, true,
+            false, 0.0, LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il);
+    } else {
+        moe_out = build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp, model.layers[il].ffn_up_exps,
             model.layers[il].ffn_gate_exps, model.layers[il].ffn_down_exps,
             nullptr,
             n_expert, n_expert_used, LLM_FFN_SILU,
             true, false, 0.0, LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il);
+    }
     cb(moe_out, "ffn_moe_out", il);
 
     // Add shared experts if present - following Qwen3Next reference implementation
