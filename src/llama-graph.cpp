@@ -1016,9 +1016,11 @@ ggml_tensor * llm_graph_context::build_lora_mm_tp_row(
     GGML_ASSERT(half_ne0 % blck == 0 && "TP row split: half dimension must be divisible by quantization block size");
 
     // split weight along ne[0] (input/reduction dimension)
+    // views along ne[0] of quantized tensors are non-contiguous (nb[1] > ne[0] row size),
+    // so we use ggml_cont to make contiguous copies for backends that require it (e.g. Vulkan)
     const int64_t byte_offset = (half_ne0 / blck) * ggml_type_size(w->type);
-    ggml_tensor * w0 = ggml_view_2d(ctx0, w, half_ne0, ne1, w->nb[1], 0);
-    ggml_tensor * w1 = ggml_view_2d(ctx0, w, half_ne0, ne1, w->nb[1], byte_offset);
+    ggml_tensor * w0 = ggml_cont(ctx0, ggml_view_2d(ctx0, w, half_ne0, ne1, w->nb[1], 0));
+    ggml_tensor * w1 = ggml_cont(ctx0, ggml_view_2d(ctx0, w, half_ne0, ne1, w->nb[1], byte_offset));
 
     // each device does its matmul with its local activation shard
     ggml_tensor * res0 = ggml_mul_mat(ctx0, w0, cur0);
