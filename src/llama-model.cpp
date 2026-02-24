@@ -2695,9 +2695,13 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     }
 
     // build a list of buffer types for the CPU and GPU devices
+    // when TP is enabled, use LAYER mode for buffer allocation (split buffer types only work
+    // for same-registry multi-GPU like CUDA). The TP graph helpers handle the actual parallelism
+    // via view-based splitting and scheduler-managed cross-device copies.
+    const auto buft_split_mode = tp ? LLAMA_SPLIT_MODE_LAYER : split_mode;
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
     for (auto * dev : devices) {
-        buft_list_t buft_list = make_gpu_buft_list(dev, split_mode, tensor_split);
+        buft_list_t buft_list = make_gpu_buft_list(dev, buft_split_mode, tensor_split);
         // add CPU buffer types as a fallback
         buft_list.insert(buft_list.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
         pimpl->gpu_buft_list.emplace(dev, std::move(buft_list));
