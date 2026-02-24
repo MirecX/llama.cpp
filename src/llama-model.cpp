@@ -2772,6 +2772,39 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer);
 
+    // TP override: all weights go to the primary local device.
+    // The TP graph helpers split computations across devices via views,
+    // and the scheduler copies weight slices to remote devices as needed.
+    if (tp) {
+        ggml_backend_dev_t primary_dev = nullptr;
+        size_t max_free = 0;
+        for (auto * dev : devices) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            if (std::string(ggml_backend_reg_name(reg)) == "RPC") {
+                continue;
+            }
+            size_t free, total;
+            ggml_backend_dev_memory(dev, &free, &total);
+            if (free == 0 && total == 0) {
+                ggml_backend_dev_memory(cpu_dev, &free, &total);
+            }
+            if (free > max_free || primary_dev == nullptr) {
+                max_free = free;
+                primary_dev = dev;
+            }
+        }
+        if (!primary_dev) {
+            primary_dev = devices[0];
+        }
+        LLAMA_LOG_INFO("%s: TP mode: all weights assigned to %s (%zu MiB free)\n",
+                __func__, ggml_backend_dev_name(primary_dev), max_free / 1024 / 1024);
+        auto & primary_buft = pimpl->gpu_buft_list.at(primary_dev);
+        for (int il = 0; il < n_layer; ++il) {
+            pimpl->dev_layer[il] = {primary_dev, &primary_buft};
+        }
+        pimpl->dev_output = {primary_dev, &primary_buft};
+    }
+
     // one ggml context per buffer type
     int max_n_tensors = ml.n_tensors;
     max_n_tensors += 1;         // duplicated output tensor
