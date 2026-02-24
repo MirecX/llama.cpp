@@ -1,6 +1,7 @@
 #include "models.h"
 
 #include "llama-memory-recurrent.h"
+#include "ggml-backend.h"
 
 llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
@@ -118,6 +119,10 @@ ggml_tensor * llm_build_qwen35moe ::build_layer_attn(
     const int64_t n_embd_head = hparams.n_embd_head_v;
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
 
+    if (tp) {
+        return build_layer_attn_tp(inp, cur, inp_pos, sections, il);
+    }
+
     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
 
     // Qwen3Next uses a single Q projection that outputs query + gate
@@ -186,6 +191,114 @@ ggml_tensor * llm_build_qwen35moe ::build_layer_attn(
 
     cur = build_lora_mm(model.layers[il].wo, cur);
     cb(cur, "attn_output", il);
+
+    return cur;
+}
+
+ggml_tensor * llm_build_qwen35moe ::build_layer_attn_tp(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor *             cur,
+        ggml_tensor *             inp_pos,
+        int *                     sections,
+        int                       il) {
+    // TP attention for Qwen3.5 MoE standard attention layers
+    // Handles the fused Q+gate projection by splitting along the head dimension
+    const int64_t n_embd_head = hparams.n_embd_head_v;
+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
+    GGML_ASSERT(n_head % 2 == 0);
+    GGML_ASSERT(n_head_kv % 2 == 0);
+
+    const int64_t half_n_head    = n_head / 2;
+    const int64_t half_n_head_kv = n_head_kv / 2;
+
+    // Column-parallel Q+gate projection: wq has shape [n_embd, n_embd_head*2*n_head]
+    // Split along ne[1] gives each device n_embd_head*2*n_head/2 = n_embd_head*2*half_n_head outputs
+    auto [qg0, qg1] = build_lora_mm_tp_col(model.layers[il].wq, cur);
+    cb(qg0, "Qcur_full_tp0", il);
+    cb(qg1, "Qcur_full_tp1", il);
+
+    // Extract Q and gate from each shard (each has half_n_head heads with 2*n_embd_head per head)
+    // Q: stride-2 view extracting first n_embd_head of each 2*n_embd_head block
+    ggml_tensor * Qcur0 = ggml_view_3d(ctx0, qg0, n_embd_head, half_n_head, n_tokens,
+        ggml_element_size(qg0) * n_embd_head * 2,
+        ggml_element_size(qg0) * n_embd_head * 2 * half_n_head, 0);
+    ggml_tensor * Qcur1 = ggml_view_3d(ctx0, qg1, n_embd_head, half_n_head, n_tokens,
+        ggml_element_size(qg1) * n_embd_head * 2,
+        ggml_element_size(qg1) * n_embd_head * 2 * half_n_head, 0);
+
+    // Apply Q normalization (per-head, so works on each shard independently)
+    Qcur0 = build_norm(Qcur0, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
+    Qcur1 = build_norm(Qcur1, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
+
+    // Gate: extract second n_embd_head of each 2*n_embd_head block
+    ggml_tensor * gate0 = ggml_view_3d(ctx0, qg0, n_embd_head, half_n_head, n_tokens,
+        ggml_element_size(qg0) * n_embd_head * 2,
+        ggml_element_size(qg0) * n_embd_head * 2 * half_n_head,
+        ggml_element_size(qg0) * n_embd_head);
+    ggml_tensor * gate1 = ggml_view_3d(ctx0, qg1, n_embd_head, half_n_head, n_tokens,
+        ggml_element_size(qg1) * n_embd_head * 2,
+        ggml_element_size(qg1) * n_embd_head * 2 * half_n_head,
+        ggml_element_size(qg1) * n_embd_head);
+    gate0 = ggml_cont_2d(ctx0, gate0, n_embd_head * half_n_head, n_tokens);
+    gate1 = ggml_cont_2d(ctx0, gate1, n_embd_head * half_n_head, n_tokens);
+
+    // Column-parallel K and V projections
+    auto [k0, k1] = build_lora_mm_tp_col(model.layers[il].wk, cur);
+    auto [v0, v1] = build_lora_mm_tp_col(model.layers[il].wv, cur);
+
+    // Reshape K and V to [n_embd_head, half_n_head_kv, n_tokens]
+    ggml_tensor * Kcur0 = ggml_reshape_3d(ctx0, k0, n_embd_head, half_n_head_kv, n_tokens);
+    ggml_tensor * Kcur1 = ggml_reshape_3d(ctx0, k1, n_embd_head, half_n_head_kv, n_tokens);
+    ggml_tensor * Vcur0 = ggml_reshape_3d(ctx0, v0, n_embd_head, half_n_head_kv, n_tokens);
+    ggml_tensor * Vcur1 = ggml_reshape_3d(ctx0, v1, n_embd_head, half_n_head_kv, n_tokens);
+
+    // Apply K normalization (per-head)
+    Kcur0 = build_norm(Kcur0, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+    Kcur1 = build_norm(Kcur1, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+
+    // Apply IMRoPE to each shard
+    Qcur0 = ggml_rope_multi(ctx0, Qcur0, inp_pos, nullptr,
+            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+    Qcur1 = ggml_rope_multi(ctx0, Qcur1, inp_pos, nullptr,
+            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+    Kcur0 = ggml_rope_multi(ctx0, Kcur0, inp_pos, nullptr,
+            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+    Kcur1 = ggml_rope_multi(ctx0, Kcur1, inp_pos, nullptr,
+            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+
+    cb(Qcur0, "Qcur_tp0", il);
+    cb(Qcur1, "Qcur_tp1", il);
+    cb(Kcur0, "Kcur_tp0", il);
+    cb(Kcur1, "Kcur_tp1", il);
+
+    // Attention for each shard (each device handles its half of heads independently)
+    const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+
+    // Note: passing wo=nullptr so build_attn doesn't apply output projection
+    ggml_tensor * attn0 = build_attn(inp, nullptr, nullptr, Qcur0, Kcur0, Vcur0, nullptr, nullptr, nullptr, kq_scale, il);
+    ggml_tensor * attn1 = build_attn(inp, nullptr, nullptr, Qcur1, Kcur1, Vcur1, nullptr, nullptr, nullptr, kq_scale, il);
+    cb(attn0, "attn_tp0", il);
+    cb(attn1, "attn_tp1", il);
+
+    // Apply gate sigmoid to each shard
+    ggml_tensor * gate_sigmoid0 = ggml_sigmoid(ctx0, gate0);
+    ggml_tensor * gate_sigmoid1 = ggml_sigmoid(ctx0, gate1);
+    attn0 = ggml_mul(ctx0, attn0, gate_sigmoid0);
+    attn1 = ggml_mul(ctx0, attn1, gate_sigmoid1);
+    cb(attn0, "attn_gated_tp0", il);
+    cb(attn1, "attn_gated_tp1", il);
+
+    // Hint backends
+    ggml_backend_sched_set_tensor_backend(sched, attn0, get_tp_backend(0));
+    ggml_backend_sched_set_tensor_backend(sched, attn1, get_tp_backend(1));
+
+    // Row-parallel output projection + all-reduce
+    cur = build_lora_mm_tp_row(model.layers[il].wo, attn0, attn1);
+    cb(cur, "attn_output_tp", il);
 
     return cur;
 }
@@ -373,6 +486,7 @@ ggml_tensor * llm_build_qwen35moe ::build_layer_ffn(ggml_tensor * cur, const int
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
+    // MoE routed experts — no TP for v1, run normally
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp, model.layers[il].ffn_up_exps,
@@ -384,13 +498,23 @@ ggml_tensor * llm_build_qwen35moe ::build_layer_ffn(ggml_tensor * cur, const int
 
     // Add shared experts if present - following Qwen3Next reference implementation
     if (model.layers[il].ffn_up_shexp != nullptr) {
-        ggml_tensor * ffn_shexp =
-            build_ffn(cur,
+        ggml_tensor * ffn_shexp;
+
+        if (tp) {
+            // TP path: column/row parallel shared expert FFN
+            ffn_shexp = build_ffn_tp(cur,
+                model.layers[il].ffn_up_shexp,
+                model.layers[il].ffn_gate_shexp,
+                model.layers[il].ffn_down_shexp,
+                LLM_FFN_SILU, LLM_FFN_PAR, il);
+        } else {
+            ffn_shexp = build_ffn(cur,
                 model.layers[il].ffn_up_shexp, NULL, NULL,
                 model.layers[il].ffn_gate_shexp, NULL, NULL,
                 model.layers[il].ffn_down_shexp, NULL, NULL,
                 NULL,
                 LLM_FFN_SILU, LLM_FFN_PAR, il);
+        }
         cb(ffn_shexp, "ffn_shexp", il);
 
         // Apply shared expert gating as in the reference implementation
@@ -402,7 +526,6 @@ ggml_tensor * llm_build_qwen35moe ::build_layer_ffn(ggml_tensor * cur, const int
         // Apply sigmoid to the gate
         shared_gate = ggml_sigmoid(ctx0, shared_gate);
         cb(shared_gate, "shared_expert_gate_sigmoid", il);
-
 
         // Apply the gate to the shared expert output
         ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);

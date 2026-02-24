@@ -4,6 +4,8 @@
 #include "llama-batch.h"
 #include "llama-cparams.h"
 
+#include "ggml-backend.h"
+
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-memory-hybrid.h"
@@ -873,6 +875,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     rope_type        (hparams.rope_type),
     sched            (params.sched),
     backend_cpu      (params.backend_cpu),
+    tp               (params.tp),
+    tp_size          (params.tp_size),
     cvec             (params.cvec),
     loras            (params.loras),
     mctx             (params.mctx),
@@ -947,6 +951,222 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
         res = ggml_add(ctx0, res, ab_cur);
     }
+
+    return res;
+}
+
+//
+// tensor parallelism helpers
+//
+
+ggml_backend_t llm_graph_context::get_tp_backend(int idx) const {
+    GGML_ASSERT(idx >= 0 && idx < tp_size);
+
+    // find non-CPU backends from the scheduler
+    int gpu_idx = 0;
+    const int n_backends = ggml_backend_sched_get_n_backends(sched);
+    for (int i = 0; i < n_backends; i++) {
+        ggml_backend_t be = ggml_backend_sched_get_backend(sched, i);
+        if (be != backend_cpu) {
+            if (gpu_idx == idx) {
+                return be;
+            }
+            gpu_idx++;
+        }
+    }
+    GGML_ABORT("TP backend %d not found (only %d GPU backends available)", idx, gpu_idx);
+}
+
+std::pair<ggml_tensor *, ggml_tensor *> llm_graph_context::build_lora_mm_tp_col(
+          ggml_tensor * w,
+          ggml_tensor * cur) const {
+    GGML_ASSERT(tp && tp_size == 2);
+    GGML_ASSERT(w->ne[1] % 2 == 0);
+
+    const int64_t ne0 = w->ne[0];
+    const int64_t half_ne1 = w->ne[1] / 2;
+
+    // create views splitting the weight along ne[1] (output dimension)
+    ggml_tensor * w0 = ggml_view_2d(ctx0, w, ne0, half_ne1, w->nb[1], 0);
+    ggml_tensor * w1 = ggml_view_2d(ctx0, w, ne0, half_ne1, w->nb[1], half_ne1 * w->nb[1]);
+
+    // matmul each shard — scheduler will copy inputs to the right device
+    ggml_tensor * res0 = ggml_mul_mat(ctx0, w0, cur);
+    ggml_tensor * res1 = ggml_mul_mat(ctx0, w1, cur);
+
+    // hint the scheduler: run res0 on device 0, res1 on device 1
+    ggml_backend_sched_set_tensor_backend(sched, res0, get_tp_backend(0));
+    ggml_backend_sched_set_tensor_backend(sched, res1, get_tp_backend(1));
+
+    return {res0, res1};
+}
+
+ggml_tensor * llm_graph_context::build_lora_mm_tp_row(
+          ggml_tensor * w,
+          ggml_tensor * cur0,
+          ggml_tensor * cur1) const {
+    GGML_ASSERT(tp && tp_size == 2);
+    GGML_ASSERT(w->ne[0] % 2 == 0);
+
+    const int64_t half_ne0 = w->ne[0] / 2;
+    const int64_t ne1 = w->ne[1];
+
+    // for quantized tensors, split must be at block boundary
+    const int64_t blck = ggml_blck_size(w->type);
+    GGML_ASSERT(half_ne0 % blck == 0 && "TP row split: half dimension must be divisible by quantization block size");
+
+    // split weight along ne[0] (input/reduction dimension)
+    const int64_t byte_offset = (half_ne0 / blck) * ggml_type_size(w->type);
+    ggml_tensor * w0 = ggml_view_2d(ctx0, w, half_ne0, ne1, w->nb[1], 0);
+    ggml_tensor * w1 = ggml_view_2d(ctx0, w, half_ne0, ne1, w->nb[1], byte_offset);
+
+    // each device does its matmul with its local activation shard
+    ggml_tensor * res0 = ggml_mul_mat(ctx0, w0, cur0);
+    ggml_tensor * res1 = ggml_mul_mat(ctx0, w1, cur1);
+
+    // hint backends
+    ggml_backend_sched_set_tensor_backend(sched, res0, get_tp_backend(0));
+    ggml_backend_sched_set_tensor_backend(sched, res1, get_tp_backend(1));
+
+    // all-reduce: add results from both devices
+    ggml_tensor * res = ggml_add(ctx0, res0, res1);
+
+    return res;
+}
+
+ggml_tensor * llm_graph_context::build_ffn_tp(
+         ggml_tensor * cur,
+         ggml_tensor * up,
+         ggml_tensor * gate,
+         ggml_tensor * down,
+     llm_ffn_op_type   type_op,
+   llm_ffn_gate_type   type_gate,
+                 int   il) const {
+    GGML_ASSERT(tp && tp_size == 2);
+
+    // column-parallel: split gate and up along ne[1] (output dimension)
+    auto [up0, up1] = build_lora_mm_tp_col(up, cur);
+    cb(up0, "ffn_up_tp0", il);
+    cb(up1, "ffn_up_tp1", il);
+
+    ggml_tensor * act0, * act1;
+
+    if (gate && type_gate == LLM_FFN_PAR) {
+        // parallel gate
+        auto [gate0, gate1] = build_lora_mm_tp_col(gate, cur);
+        cb(gate0, "ffn_gate_tp0", il);
+        cb(gate1, "ffn_gate_tp1", il);
+
+        switch (type_op) {
+            case LLM_FFN_SILU:
+                act0 = ggml_swiglu_split(ctx0, gate0, up0);
+                act1 = ggml_swiglu_split(ctx0, gate1, up1);
+                break;
+            case LLM_FFN_GELU:
+                act0 = ggml_geglu_split(ctx0, gate0, up0);
+                act1 = ggml_geglu_split(ctx0, gate1, up1);
+                break;
+            case LLM_FFN_RELU:
+                act0 = ggml_reglu_split(ctx0, gate0, up0);
+                act1 = ggml_reglu_split(ctx0, gate1, up1);
+                break;
+            default:
+                GGML_ABORT("unsupported activation for TP FFN");
+        }
+    } else {
+        // no gate or sequential gate — apply activation to up directly
+        switch (type_op) {
+            case LLM_FFN_SILU:
+                act0 = ggml_silu(ctx0, up0);
+                act1 = ggml_silu(ctx0, up1);
+                break;
+            case LLM_FFN_GELU:
+                act0 = ggml_gelu(ctx0, up0);
+                act1 = ggml_gelu(ctx0, up1);
+                break;
+            case LLM_FFN_RELU:
+                act0 = ggml_relu(ctx0, up0);
+                act1 = ggml_relu(ctx0, up1);
+                break;
+            default:
+                GGML_ABORT("unsupported activation for TP FFN");
+        }
+    }
+
+    cb(act0, "ffn_act_tp0", il);
+    cb(act1, "ffn_act_tp1", il);
+
+    // keep activations on their respective devices
+    ggml_backend_sched_set_tensor_backend(sched, act0, get_tp_backend(0));
+    ggml_backend_sched_set_tensor_backend(sched, act1, get_tp_backend(1));
+
+    // row-parallel down projection + all-reduce
+    ggml_tensor * res = build_lora_mm_tp_row(down, act0, act1);
+    cb(res, "ffn_down_tp", il);
+
+    return res;
+}
+
+ggml_tensor * llm_graph_context::build_attn_tp(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * wq,
+        ggml_tensor * wk,
+        ggml_tensor * wv,
+        ggml_tensor * wo,
+        ggml_tensor * cur,
+        ggml_tensor * kq_b,
+        ggml_tensor * sinks,
+              float   kq_scale,
+                int   il,
+                int   il_n_head,
+                int   il_n_head_kv,
+                int   il_n_embd_head_k,
+                int   il_n_embd_head_v) const {
+    GGML_ASSERT(tp && tp_size == 2);
+    GGML_ASSERT(il_n_head % 2 == 0);
+    GGML_ASSERT(il_n_head_kv % 2 == 0);
+
+    const int half_n_head    = il_n_head / 2;
+    const int half_n_head_kv = il_n_head_kv / 2;
+
+    // column-parallel QKV projections — each device gets half the heads
+    auto [q0, q1] = build_lora_mm_tp_col(wq, cur);
+    auto [k0, k1] = build_lora_mm_tp_col(wk, cur);
+    auto [v0, v1] = build_lora_mm_tp_col(wv, cur);
+
+    // reshape to [n_embd_head, n_head/2, n_tokens]
+    ggml_tensor * Qcur0 = ggml_reshape_3d(ctx0, q0, il_n_embd_head_k, half_n_head, n_tokens);
+    ggml_tensor * Qcur1 = ggml_reshape_3d(ctx0, q1, il_n_embd_head_k, half_n_head, n_tokens);
+    ggml_tensor * Kcur0 = ggml_reshape_3d(ctx0, k0, il_n_embd_head_k, half_n_head_kv, n_tokens);
+    ggml_tensor * Kcur1 = ggml_reshape_3d(ctx0, k1, il_n_embd_head_k, half_n_head_kv, n_tokens);
+    ggml_tensor * Vcur0 = ggml_reshape_3d(ctx0, v0, il_n_embd_head_v, half_n_head_kv, n_tokens);
+    ggml_tensor * Vcur1 = ggml_reshape_3d(ctx0, v1, il_n_embd_head_v, half_n_head_kv, n_tokens);
+
+    cb(Qcur0, "Qcur_tp0", il);
+    cb(Qcur1, "Qcur_tp1", il);
+    cb(Kcur0, "Kcur_tp0", il);
+    cb(Kcur1, "Kcur_tp1", il);
+
+    // each device builds attention for its half of the heads
+    // for the KV cache: we store both halves in the same cache but at different head offsets
+    // note: for simplicity in v1, we run both halves through the same build_attn path
+    // this means both run on the same device (scheduler decides) but with half the heads
+
+    // device 0: attention for heads 0..half_n_head-1
+    ggml_tensor * attn0 = build_attn(inp, nullptr, nullptr, Qcur0, Kcur0, Vcur0, kq_b, sinks, nullptr, kq_scale, il);
+    cb(attn0, "attn_tp0", il);
+
+    // device 1: attention for heads half_n_head..n_head-1
+    ggml_tensor * attn1 = build_attn(inp, nullptr, nullptr, Qcur1, Kcur1, Vcur1, kq_b, sinks, nullptr, kq_scale, il);
+    cb(attn1, "attn_tp1", il);
+
+    // hint backends for the attention outputs
+    ggml_backend_sched_set_tensor_backend(sched, attn0, get_tp_backend(0));
+    ggml_backend_sched_set_tensor_backend(sched, attn1, get_tp_backend(1));
+
+    // row-parallel output projection + all-reduce
+    ggml_tensor * res = build_lora_mm_tp_row(wo, attn0, attn1);
+    cb(res, "attn_wo_tp", il);
 
     return res;
 }

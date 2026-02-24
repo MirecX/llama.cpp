@@ -11,6 +11,7 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <utility>
 
 struct ggml_cgraph;
 struct ggml_context;
@@ -529,6 +530,10 @@ struct llm_graph_params {
     ggml_backend_sched_t sched;
     ggml_backend_t backend_cpu;
 
+    // tensor parallelism
+    bool tp = false;
+    int  tp_size = 0;
+
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
@@ -737,6 +742,10 @@ struct llm_graph_context {
 
     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
 
+    // tensor parallelism
+    const bool tp;
+    const int  tp_size;
+
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
@@ -797,6 +806,52 @@ struct llm_graph_context {
          llm_ffn_op_type   type_op,
        llm_ffn_gate_type   type_gate,
                      int   il) const;
+
+    //
+    // tensor parallelism helpers
+    //
+
+    // get TP backend for device index (0 or 1). returns non-CPU GPU backends.
+    ggml_backend_t get_tp_backend(int idx) const;
+
+    // column-parallel matmul: split w along ne[1], run two matmuls on different devices
+    // returns {result_on_dev0, result_on_dev1}
+    std::pair<ggml_tensor *, ggml_tensor *> build_lora_mm_tp_col(
+              ggml_tensor * w,
+              ggml_tensor * cur) const;
+
+    // row-parallel matmul + all-reduce: split w along ne[0], run two matmuls, add results
+    ggml_tensor * build_lora_mm_tp_row(
+              ggml_tensor * w,
+              ggml_tensor * cur0,
+              ggml_tensor * cur1) const;
+
+    // TP dense FFN: column-parallel gate/up, row-parallel down + all-reduce
+    ggml_tensor * build_ffn_tp(
+             ggml_tensor * cur,
+             ggml_tensor * up,
+             ggml_tensor * gate,
+             ggml_tensor * down,
+         llm_ffn_op_type   type_op,
+       llm_ffn_gate_type   type_gate,
+                     int   il) const;
+
+    // TP attention for KV cache variant: column-parallel QKV, row-parallel output + all-reduce
+    ggml_tensor * build_attn_tp(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * wq,
+            ggml_tensor * wk,
+            ggml_tensor * wv,
+            ggml_tensor * wo,
+            ggml_tensor * cur,
+            ggml_tensor * kq_b,
+            ggml_tensor * sinks,
+                  float   kq_scale,
+                    int   il,
+                    int   n_head,
+                    int   n_head_kv,
+                    int   n_embd_head_k,
+                    int   n_embd_head_v) const;
 
     // build MoE FFN without bias tensors
     ggml_tensor * build_moe_ffn(

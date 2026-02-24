@@ -438,6 +438,28 @@ struct llama_layer {
     struct ggml_tensor * indexer_attn_k   = nullptr;
     struct ggml_tensor * indexer_attn_q_b = nullptr; // note: for lora a/b, not bias
 
+    // tensor parallelism (TP) — split weight shards, one per device
+    // attention: column-parallel QKV (split ne[1]), row-parallel output (split ne[0])
+    struct ggml_tensor * wq_tp[2] = {};
+    struct ggml_tensor * wk_tp[2] = {};
+    struct ggml_tensor * wv_tp[2] = {};
+    struct ggml_tensor * wo_tp[2] = {};  // row-parallel
+
+    // dense FFN: column-parallel gate/up (split ne[1]), row-parallel down (split ne[0])
+    struct ggml_tensor * ffn_gate_tp[2] = {};
+    struct ggml_tensor * ffn_up_tp[2]   = {};
+    struct ggml_tensor * ffn_down_tp[2] = {};  // row-parallel
+
+    // MoE experts: expert-parallel (split ne[2] = n_expert dimension)
+    struct ggml_tensor * ffn_gate_exps_tp[2] = {};
+    struct ggml_tensor * ffn_down_exps_tp[2] = {};
+    struct ggml_tensor * ffn_up_exps_tp[2]   = {};
+
+    // shared experts: column/row parallel like dense FFN
+    struct ggml_tensor * ffn_gate_shexp_tp[2] = {};
+    struct ggml_tensor * ffn_up_shexp_tp[2]   = {};
+    struct ggml_tensor * ffn_down_shexp_tp[2] = {};  // row-parallel
+
     struct llama_layer_posnet posnet;
 
     struct llama_layer_convnext convnext;
@@ -508,6 +530,10 @@ struct llama_model {
 
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
+
+    // tensor parallelism state
+    bool tp = false;  // true when split_mode==ROW and n_devices>=2
+    int  tp_size = 0; // number of TP devices (0 or 2)
 
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;
