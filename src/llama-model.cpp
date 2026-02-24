@@ -2692,6 +2692,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         tp = true;
         tp_size = 2; // currently only 2-way TP supported
         LLAMA_LOG_INFO("%s: tensor parallelism enabled with %zu devices\n", __func__, devices.size());
+        fprintf(stderr, "TP: enabled with %zu devices\n", devices.size());
     }
 
     // compute expert-parallel split for MoE TP
@@ -2709,6 +2710,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         tp_expert_split[1] = n_exp - tp_expert_split[0];
         LLAMA_LOG_INFO("%s: expert-parallel TP: device 0 gets %d experts, device 1 gets %d experts\n",
                 __func__, tp_expert_split[0], tp_expert_split[1]);
+        fprintf(stderr, "TP: expert split: dev0=%d, dev1=%d (of %d total)\n",
+                tp_expert_split[0], tp_expert_split[1], n_exp);
     }
 
     // build a list of buffer types for the CPU and GPU devices
@@ -7944,6 +7947,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     // copy expert weights from monolithic tensors to per-device TP shards
     if (tp && hparams.n_expert > 0) {
         LLAMA_LOG_INFO("%s: copying expert weights to TP shards...\n", __func__);
+        fprintf(stderr, "TP: copying expert weights to shards (n0=%d, n1=%d)...\n",
+                tp_expert_split[0], tp_expert_split[1]);
         const int n0 = tp_expert_split[0];
         const int n1 = tp_expert_split[1];
 
@@ -7961,6 +7966,11 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 const size_t src_offset = (size_t)expert_start * expert_bytes;
                 const size_t total_bytes = (size_t)n_experts_shard * expert_bytes;
 
+                if (il == 0) {
+                    fprintf(stderr, "  copy %s -> %s: expert_start=%d n=%d expert_bytes=%zu total=%zu type=%d\n",
+                            full->name, shard->name, expert_start, n_experts_shard, expert_bytes, total_bytes, (int)full->type);
+                }
+
                 std::vector<uint8_t> buf(total_bytes);
                 ggml_backend_tensor_get(full, buf.data(), src_offset, total_bytes);
                 ggml_backend_tensor_set(shard, buf.data(), 0, total_bytes);
@@ -7977,6 +7987,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             copy_expert_shard(layer.ffn_up_exps,   layer.ffn_up_exps_tp[1],   n0, n1);
         }
         LLAMA_LOG_INFO("%s: expert TP shard copy complete\n", __func__);
+        fprintf(stderr, "TP: expert shard copy complete\n");
     }
 
     if (use_mmap_buffer) {

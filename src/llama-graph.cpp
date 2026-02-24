@@ -1722,6 +1722,26 @@ ggml_tensor * llm_graph_context::build_moe_ffn_tp(
     const int64_t n0 = n_expert_split[0];
     const int64_t n1 = n_expert_split[1];
 
+    if (il == 0) {
+        fprintf(stderr, "TP-MoE[%d]: n_expert=%lld, n_expert_used=%lld, split=[%lld,%lld]\n",
+                il, (long long)n_expert, (long long)n_expert_used, (long long)n0, (long long)n1);
+        fprintf(stderr, "  gate_tp[0]: type=%d ne=[%lld,%lld,%lld] | gate_tp[1]: type=%d ne=[%lld,%lld,%lld]\n",
+                (int)gate_exps_tp[0]->type,
+                (long long)gate_exps_tp[0]->ne[0], (long long)gate_exps_tp[0]->ne[1], (long long)gate_exps_tp[0]->ne[2],
+                (int)gate_exps_tp[1]->type,
+                (long long)gate_exps_tp[1]->ne[0], (long long)gate_exps_tp[1]->ne[1], (long long)gate_exps_tp[1]->ne[2]);
+        fprintf(stderr, "  up_tp[0]: type=%d ne=[%lld,%lld,%lld] | up_tp[1]: type=%d ne=[%lld,%lld,%lld]\n",
+                (int)up_exps_tp[0]->type,
+                (long long)up_exps_tp[0]->ne[0], (long long)up_exps_tp[0]->ne[1], (long long)up_exps_tp[0]->ne[2],
+                (int)up_exps_tp[1]->type,
+                (long long)up_exps_tp[1]->ne[0], (long long)up_exps_tp[1]->ne[1], (long long)up_exps_tp[1]->ne[2]);
+        fprintf(stderr, "  down_tp[0]: type=%d ne=[%lld,%lld,%lld] | down_tp[1]: type=%d ne=[%lld,%lld,%lld]\n",
+                (int)down_exps_tp[0]->type,
+                (long long)down_exps_tp[0]->ne[0], (long long)down_exps_tp[0]->ne[1], (long long)down_exps_tp[0]->ne[2],
+                (int)down_exps_tp[1]->type,
+                (long long)down_exps_tp[1]->ne[0], (long long)down_exps_tp[1]->ne[1], (long long)down_exps_tp[1]->ne[2]);
+    }
+
     // ---- routing (on primary device, same as non-TP) ----
     ggml_tensor * logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
     cb(logits, "ffn_moe_logits", il);
