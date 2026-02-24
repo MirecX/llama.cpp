@@ -1955,9 +1955,9 @@ void llama_context::output_reorder() {
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
         uint32_t base = std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
-        // expert-parallel TP adds ~60 graph nodes per MoE layer (2 devices × ~30 ops each)
+        // expert-parallel TP adds many extra graph nodes per MoE layer
         if (model.tp && model.hparams.n_expert > 0) {
-            base += model.hparams.n_layer * 80;
+            base = std::max(base, base + model.hparams.n_layer * 200);
         }
         return base;
     }
