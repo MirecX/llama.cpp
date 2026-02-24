@@ -972,8 +972,9 @@ static struct llama_model * llama_model_load_from_file_impl(
         // add GPUs
         model->devices.insert(model->devices.end(), gpus.begin(), gpus.end());
 
-        // add integrated GPUs only if no other devices were found
-        if (model->devices.empty()) {
+        // add integrated GPUs if no other devices were found, or if using
+        // split_mode ROW (tensor parallelism) which needs all available devices
+        if (model->devices.empty() || params.split_mode == LLAMA_SPLIT_MODE_ROW) {
             model->devices.insert(model->devices.end(), igpus.begin(), igpus.end());
         }
     }
