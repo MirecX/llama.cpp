@@ -7880,6 +7880,19 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
             }
+            // Debug: dump tensor allocation state
+            {
+                int n_tensors = 0;
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                    if (n_tensors < 3 || strstr(t->name, "_tp")) {
+                        fprintf(stderr, "ALLOC-DEBUG: buft=%s tensor='%s' data=%p buffer=%p\n",
+                                ggml_backend_buft_name(buft), t->name, t->data, (void*)t->buffer);
+                    }
+                    n_tensors++;
+                }
+                fprintf(stderr, "ALLOC-DEBUG: buft=%s total_tensors=%d buf_size=%zu\n",
+                        ggml_backend_buft_name(buft), n_tensors, ggml_backend_buffer_get_size(buf));
+            }
             if (use_mlock && ggml_backend_buffer_is_host(buf)) {
                 pimpl->mlock_bufs.emplace_back(new llama_mlock);
                 auto & mlock_buf = pimpl->mlock_bufs.back();
@@ -7969,6 +7982,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 if (il == 0) {
                     fprintf(stderr, "  copy %s -> %s: expert_start=%d n=%d expert_bytes=%zu total=%zu type=%d\n",
                             full->name, shard->name, expert_start, n_experts_shard, expert_bytes, total_bytes, (int)full->type);
+                    fprintf(stderr, "    full: data=%p buffer=%p | shard: data=%p buffer=%p\n",
+                            full->data, (void*)full->buffer, shard->data, (void*)shard->buffer);
                 }
 
                 std::vector<uint8_t> buf(total_bytes);
