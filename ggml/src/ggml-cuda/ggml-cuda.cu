@@ -2274,53 +2274,6 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ggml_backend_buft_is_cuda_split(src0->buffer->buft) && "mul_mat_id does not support split buffers");
 
-    // DEBUG: check for pre-existing CUDA errors and validate memory pointers
-    {
-        static int mmid_count = 0;
-        if (mmid_count < 200) {
-            // Check for pre-existing CUDA error from previous operations
-            cudaError_t prev_err = cudaGetLastError();
-            if (prev_err != cudaSuccess) {
-                fprintf(stderr, "MMID-PREERR[%d] '%s': pre-existing CUDA error %d (%s) BEFORE MUL_MAT_ID\n",
-                        mmid_count, dst->name, prev_err, cudaGetErrorString(prev_err));
-            }
-
-            // Validate src0 (weights)
-            size_t src0_bytes = ggml_nbytes(src0);
-            char test_byte;
-            cudaError_t e_src0_first = cudaMemcpy(&test_byte, src0->data, 1, cudaMemcpyDeviceToHost);
-            cudaError_t e_src0_last = (src0_bytes > 1) ?
-                cudaMemcpy(&test_byte, (const char*)src0->data + src0_bytes - 1, 1, cudaMemcpyDeviceToHost) : cudaSuccess;
-
-            // Validate src1
-            size_t src1_bytes = ggml_nbytes(src1);
-            cudaError_t e_src1_first = cudaMemcpy(&test_byte, src1->data, 1, cudaMemcpyDeviceToHost);
-            cudaError_t e_src1_last = (src1_bytes > 1) ?
-                cudaMemcpy(&test_byte, (const char*)src1->data + src1_bytes - 1, 1, cudaMemcpyDeviceToHost) : cudaSuccess;
-
-            // Validate ids
-            size_t ids_bytes = ggml_nbytes(ids);
-            cudaError_t e_ids_first = cudaMemcpy(&test_byte, ids->data, 1, cudaMemcpyDeviceToHost);
-            cudaError_t e_ids_last = (ids_bytes > 1) ?
-                cudaMemcpy(&test_byte, (const char*)ids->data + ids_bytes - 1, 1, cudaMemcpyDeviceToHost) : cudaSuccess;
-
-            // Validate dst
-            size_t dst_bytes = ggml_nbytes(dst);
-            cudaError_t e_dst_first = cudaMemcpy(&test_byte, dst->data, 1, cudaMemcpyDeviceToHost);
-            cudaError_t e_dst_last = (dst_bytes > 1) ?
-                cudaMemcpy(&test_byte, (const char*)dst->data + dst_bytes - 1, 1, cudaMemcpyDeviceToHost) : cudaSuccess;
-
-            if (e_src0_first || e_src0_last || e_src1_first || e_src1_last || e_ids_first || e_ids_last || e_dst_first || e_dst_last) {
-                fprintf(stderr, "MMID-VALIDATE[%d] '%s': src0=%p(%zu) err=%d/%d, src1=%p(%zu) err=%d/%d, ids=%p(%zu) err=%d/%d, dst=%p(%zu) err=%d/%d\n",
-                        mmid_count, dst->name, src0->data, src0_bytes, e_src0_first, e_src0_last,
-                        src1->data, src1_bytes, e_src1_first, e_src1_last,
-                        ids->data, ids_bytes, e_ids_first, e_ids_last,
-                        dst->data, dst_bytes, e_dst_first, e_dst_last);
-            }
-            mmid_count++;
-        }
-    }
-
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
