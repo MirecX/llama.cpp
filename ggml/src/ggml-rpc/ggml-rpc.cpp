@@ -901,7 +901,7 @@ static void serialize_graph(uint32_t device, const ggml_cgraph * cgraph, std::ve
     for (uint32_t i = 0; i < n_nodes; i++) {
         add_tensor(cgraph->nodes[i], tensors, visited);
     }
-    // DEBUG: count tensors with/without RPC buffers
+    // DEBUG: count tensors with/without RPC buffers and dump node names
     {
         int n_rpc = 0, n_no_rpc = 0;
         for (const auto & t : tensors) {
@@ -909,9 +909,15 @@ static void serialize_graph(uint32_t device, const ggml_cgraph * cgraph, std::ve
             else n_no_rpc++;
         }
         static int graph_count = 0;
-        if (graph_count < 3) {
+        if (graph_count < 5) {
             fprintf(stderr, "RPC-GRAPH[%d]: device=%u n_nodes=%u n_tensors=%zu (rpc_buf=%d, no_rpc_buf=%d)\n",
                     graph_count, device, n_nodes, tensors.size(), n_rpc, n_no_rpc);
+            fprintf(stderr, "  nodes: ");
+            for (uint32_t i = 0; i < n_nodes && i < 15; i++) {
+                fprintf(stderr, "%s(%s) ", cgraph->nodes[i]->name, ggml_op_name(cgraph->nodes[i]->op));
+            }
+            if (n_nodes > 15) fprintf(stderr, "... +%u more", n_nodes - 15);
+            fprintf(stderr, "\n");
         }
         graph_count++;
     }
