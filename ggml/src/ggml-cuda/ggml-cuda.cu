@@ -2274,6 +2274,33 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ggml_backend_buft_is_cuda_split(src0->buffer->buft) && "mul_mat_id does not support split buffers");
 
+    // DEBUG: validate memory pointers for MUL_MAT_ID
+    {
+        static int mmid_count = 0;
+        if (mmid_count < 200) {
+            // Validate src1 by reading first and last byte
+            size_t src1_bytes = ggml_nbytes(src1);
+            float test_val;
+            cudaError_t err1 = cudaMemcpy(&test_val, src1->data, sizeof(float), cudaMemcpyDeviceToHost);
+            cudaError_t err2 = cudaSuccess;
+            if (src1_bytes > sizeof(float)) {
+                err2 = cudaMemcpy(&test_val, (const char*)src1->data + src1_bytes - sizeof(float), sizeof(float), cudaMemcpyDeviceToHost);
+            }
+            // Validate dst
+            size_t dst_bytes = ggml_nbytes(dst);
+            cudaError_t err3 = cudaMemcpy(&test_val, dst->data, sizeof(float), cudaMemcpyDeviceToHost);
+            cudaError_t err4 = cudaSuccess;
+            if (dst_bytes > sizeof(float)) {
+                err4 = cudaMemcpy(&test_val, (const char*)dst->data + dst_bytes - sizeof(float), sizeof(float), cudaMemcpyDeviceToHost);
+            }
+            if (err1 || err2 || err3 || err4) {
+                fprintf(stderr, "MMID-VALIDATE[%d] '%s': src1=%p (%zu bytes) err=%d/%d, dst=%p (%zu bytes) err=%d/%d\n",
+                        mmid_count, dst->name, src1->data, src1_bytes, err1, err2, dst->data, dst_bytes, err3, err4);
+            }
+            mmid_count++;
+        }
+    }
+
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
