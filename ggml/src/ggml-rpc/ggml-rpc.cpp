@@ -1628,6 +1628,23 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             return false;
         }
     }
+    // Debug: dump graph nodes before compute
+    {
+        static int graph_compute_count = 0;
+        if (graph_compute_count < 10) {
+            fprintf(stderr, "RPC-SERVER-COMPUTE[%d]: device=%u n_nodes=%d\n", graph_compute_count, device, graph->n_nodes);
+            for (int i = 0; i < graph->n_nodes && i < 20; i++) {
+                auto * node = graph->nodes[i];
+                if (!node) continue;
+                fprintf(stderr, "  [%d] '%s' op=%s data=%p buffer=%p", i, node->name, ggml_op_name(node->op), node->data, (void*)node->buffer);
+                for (int s = 0; s < GGML_MAX_SRC && node->src[s]; s++) {
+                    fprintf(stderr, " src[%d]='%s' data=%p", s, node->src[s]->name, node->src[s]->data);
+                }
+                fprintf(stderr, "\n");
+            }
+            graph_compute_count++;
+        }
+    }
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     stored_graphs[device].ctx_ptr.swap(ctx_ptr);
