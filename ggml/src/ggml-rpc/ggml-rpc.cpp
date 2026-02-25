@@ -642,6 +642,11 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
         result.buffer = ctx != nullptr ? ctx->remote_ptr : 0;
     } else {
         result.buffer = 0;
+        // DEBUG: warn about tensors with non-RPC buffers being serialized
+        if (tensor->data && tensor->op != GGML_OP_NONE) {
+            fprintf(stderr, "RPC-SERIALIZE WARNING: tensor '%s' op=%s has no RPC buffer! data=%p buffer=%p\n",
+                    tensor->name, ggml_op_name(tensor->op), tensor->data, (void*)tensor->buffer);
+        }
     }
     for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
         result.ne[i] = tensor->ne[i];
@@ -895,6 +900,20 @@ static void serialize_graph(uint32_t device, const ggml_cgraph * cgraph, std::ve
     std::unordered_set<ggml_tensor*> visited;
     for (uint32_t i = 0; i < n_nodes; i++) {
         add_tensor(cgraph->nodes[i], tensors, visited);
+    }
+    // DEBUG: count tensors with/without RPC buffers
+    {
+        int n_rpc = 0, n_no_rpc = 0;
+        for (const auto & t : tensors) {
+            if (t.buffer != 0) n_rpc++;
+            else n_no_rpc++;
+        }
+        static int graph_count = 0;
+        if (graph_count < 3) {
+            fprintf(stderr, "RPC-GRAPH[%d]: device=%u n_nodes=%u n_tensors=%zu (rpc_buf=%d, no_rpc_buf=%d)\n",
+                    graph_count, device, n_nodes, tensors.size(), n_rpc, n_no_rpc);
+        }
+        graph_count++;
     }
     // serialization format:
     // | device (4 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
