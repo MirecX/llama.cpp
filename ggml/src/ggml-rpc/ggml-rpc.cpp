@@ -909,15 +909,24 @@ static void serialize_graph(uint32_t device, const ggml_cgraph * cgraph, std::ve
             else n_no_rpc++;
         }
         static int graph_count = 0;
-        if (graph_count < 5) {
+        if (graph_count < 8) {
             fprintf(stderr, "RPC-GRAPH[%d]: device=%u n_nodes=%u n_tensors=%zu (rpc_buf=%d, no_rpc_buf=%d)\n",
                     graph_count, device, n_nodes, tensors.size(), n_rpc, n_no_rpc);
-            fprintf(stderr, "  nodes: ");
-            for (uint32_t i = 0; i < n_nodes && i < 15; i++) {
-                fprintf(stderr, "%s(%s) ", cgraph->nodes[i]->name, ggml_op_name(cgraph->nodes[i]->op));
+            fprintf(stderr, "  nodes:\n");
+            for (uint32_t i = 0; i < n_nodes; i++) {
+                ggml_tensor * node = cgraph->nodes[i];
+                const char * buf_tag = "";
+                if (node->buffer) buf_tag = "buf";
+                else if (node->data) buf_tag = "DATA-NO-BUF";
+                fprintf(stderr, "    [%3u] %-40s op=%-12s %s\n", i, node->name, ggml_op_name(node->op), buf_tag);
             }
-            if (n_nodes > 15) fprintf(stderr, "... +%u more", n_nodes - 15);
-            fprintf(stderr, "\n");
+            // also dump non-rpc tensors
+            fprintf(stderr, "  non-rpc tensors:\n");
+            for (const auto & t : tensors) {
+                if (t.buffer == 0 && t.data != 0) {
+                    fprintf(stderr, "    name=%-40s op=%u data=0x%lx\n", t.name, t.op, (unsigned long)t.data);
+                }
+            }
         }
         graph_count++;
     }

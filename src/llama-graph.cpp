@@ -1743,8 +1743,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn_tp(
     }
 
     // ---- routing (on primary device, same as non-TP) ----
+    ggml_backend_t primary_backend = get_tp_backend(0);
+
     ggml_tensor * logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
     cb(logits, "ffn_moe_logits", il);
+    ggml_backend_sched_set_tensor_backend(sched, logits, primary_backend);
 
     ggml_tensor * probs = nullptr;
     switch (gating_op) {
@@ -1758,45 +1761,55 @@ ggml_tensor * llm_graph_context::build_moe_ffn_tp(
             GGML_ABORT("unsupported gating op for TP MoE");
     }
     cb(probs, "ffn_moe_probs", il);
+    ggml_backend_sched_set_tensor_backend(sched, probs, primary_backend);
 
     // add selection bias (DeepSeek V3 / MiniMax style)
     ggml_tensor * selection_probs = probs;
     if (exp_probs_b != nullptr) {
         selection_probs = ggml_add(ctx0, probs, exp_probs_b);
         cb(selection_probs, "ffn_moe_probs_biased", il);
+        ggml_backend_sched_set_tensor_backend(sched, selection_probs, primary_backend);
     }
 
     // select top-k experts globally
     ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
     cb(selected_experts, "ffn_moe_topk", il);
+    ggml_backend_sched_set_tensor_backend(sched, selected_experts, primary_backend);
 
     // extract weights for selected experts
     probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
+    ggml_backend_sched_set_tensor_backend(sched, probs, primary_backend);
     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
     cb(weights, "ffn_moe_weights", il);
+    ggml_backend_sched_set_tensor_backend(sched, weights, primary_backend);
 
     if (norm_w) {
         weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
+        ggml_backend_sched_set_tensor_backend(sched, weights, primary_backend);
         ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights);
+        ggml_backend_sched_set_tensor_backend(sched, weights_sum, primary_backend);
         weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
+        ggml_backend_sched_set_tensor_backend(sched, weights_sum, primary_backend);
         weights = ggml_div(ctx0, weights, weights_sum);
         cb(weights, "ffn_moe_weights_norm", il);
+        ggml_backend_sched_set_tensor_backend(sched, weights, primary_backend);
         weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
+        ggml_backend_sched_set_tensor_backend(sched, weights, primary_backend);
     }
     if (scale_w) {
         weights = ggml_scale(ctx0, weights, w_scale);
+        ggml_backend_sched_set_tensor_backend(sched, weights, primary_backend);
     }
 
     ggml_build_forward_expand(gf, weights);
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd_cur, 1, n_tokens);
+    ggml_backend_sched_set_tensor_backend(sched, cur, primary_backend);
 
     // ---- per-device expert dispatch ----
     // Strategy: for each device, remap global expert IDs to local shard IDs
     // and zero out weights for experts not on that device.
     // ggml_mul_mat_id with clamped IDs + zeroed weights = correct results.
-
-    ggml_backend_t primary_backend = get_tp_backend(0);
 
     ggml_tensor * sel_f = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32); // [n_expert_used, n_tokens]
     ggml_backend_sched_set_tensor_backend(sched, sel_f, primary_backend);
@@ -1810,8 +1823,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn_tp(
 
         // remap expert IDs: subtract base, clamp to [0, nd-1]
         // experts not on this device get clamped to 0 (but their weight will be 0)
-        // pin to primary device — scheduler will copy to RPC if needed
-        ggml_tensor * local_ids_f = ggml_add(ctx0, sel_f, ggml_fill(ctx0, sel_f, -(float)id_start));
+        // pin ALL intermediates to primary device
+        ggml_tensor * id_offset = ggml_fill(ctx0, sel_f, -(float)id_start);
+        ggml_backend_sched_set_tensor_backend(sched, id_offset, primary_backend);
+        ggml_tensor * local_ids_f = ggml_add(ctx0, sel_f, id_offset);
         ggml_backend_sched_set_tensor_backend(sched, local_ids_f, primary_backend);
         local_ids_f = ggml_clamp(ctx0, local_ids_f, 0.0f, (float)(nd - 1));
         ggml_backend_sched_set_tensor_backend(sched, local_ids_f, primary_backend);
@@ -1821,14 +1836,27 @@ ggml_tensor * llm_graph_context::build_moe_ffn_tp(
 
         // create weight mask: zero out weights for experts not on this device
         // mask[i] = (selected_experts[i] >= id_start && selected_experts[i] < id_end) ? 1.0 : 0.0
-        // using step function with 0.5 offset to handle exact boundaries correctly
-        ggml_tensor * above_start = ggml_step(ctx0, ggml_add(ctx0, sel_f, ggml_fill(ctx0, sel_f, -(float)id_start + 0.5f)));
+        // pin ALL intermediates to prevent scheduler expansion leaking
+        ggml_tensor * fill_start = ggml_fill(ctx0, sel_f, -(float)id_start + 0.5f);
+        ggml_backend_sched_set_tensor_backend(sched, fill_start, primary_backend);
+        ggml_tensor * shifted_start = ggml_add(ctx0, sel_f, fill_start);
+        ggml_backend_sched_set_tensor_backend(sched, shifted_start, primary_backend);
+        ggml_tensor * above_start = ggml_step(ctx0, shifted_start);
         ggml_backend_sched_set_tensor_backend(sched, above_start, primary_backend);
-        ggml_tensor * below_end   = ggml_step(ctx0, ggml_add(ctx0, ggml_scale(ctx0, sel_f, -1.0f), ggml_fill(ctx0, sel_f, (float)id_end - 0.5f)));
+
+        ggml_tensor * neg_sel = ggml_scale(ctx0, sel_f, -1.0f);
+        ggml_backend_sched_set_tensor_backend(sched, neg_sel, primary_backend);
+        ggml_tensor * fill_end = ggml_fill(ctx0, sel_f, (float)id_end - 0.5f);
+        ggml_backend_sched_set_tensor_backend(sched, fill_end, primary_backend);
+        ggml_tensor * shifted_end = ggml_add(ctx0, neg_sel, fill_end);
+        ggml_backend_sched_set_tensor_backend(sched, shifted_end, primary_backend);
+        ggml_tensor * below_end = ggml_step(ctx0, shifted_end);
         ggml_backend_sched_set_tensor_backend(sched, below_end, primary_backend);
+
         ggml_tensor * mask = ggml_mul(ctx0, above_start, below_end); // [n_expert_used, n_tokens]
         ggml_backend_sched_set_tensor_backend(sched, mask, primary_backend);
         mask = ggml_reshape_3d(ctx0, mask, 1, n_expert_used, n_tokens);
+        ggml_backend_sched_set_tensor_backend(sched, mask, primary_backend);
         ggml_format_name(mask, "ffn_moe_mask_%d", d);
 
         ggml_tensor * masked_weights = ggml_mul(ctx0, weights, mask);
@@ -1881,18 +1909,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn_tp(
         ggml_backend_sched_set_tensor_backend(sched, experts_out, dev_backend);
 
         // aggregate across selected experts → [n_embd, n_tokens]
+        // pin ALL intermediate ops to prevent scheduler expansion leaking
         ggml_tensor * dev_experts[LLAMA_MAX_EXPERTS] = {};
         for (int64_t i = 0; i < n_expert_used; ++i) {
             dev_experts[i] = ggml_view_2d(ctx0, experts_out, n_embd_cur, n_tokens, experts_out->nb[2], i * experts_out->nb[1]);
+            ggml_backend_sched_set_tensor_backend(sched, dev_experts[i], dev_backend);
             ggml_build_forward_expand(gf, dev_experts[i]);
         }
 
         ggml_tensor * dev_out = dev_experts[0];
         for (int64_t i = 1; i < n_expert_used; ++i) {
             dev_out = ggml_add(ctx0, dev_out, dev_experts[i]);
+            ggml_backend_sched_set_tensor_backend(sched, dev_out, dev_backend);
         }
         if (n_expert_used == 1) {
             dev_out = ggml_cont(ctx0, dev_out);
+            ggml_backend_sched_set_tensor_backend(sched, dev_out, dev_backend);
         }
         ggml_format_name(dev_out, "ffn_moe_dev_%d", d);
         ggml_backend_sched_set_tensor_backend(sched, dev_out, dev_backend);
