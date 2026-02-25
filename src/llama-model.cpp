@@ -2999,6 +2999,18 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 }
             }
 
+            // TP: redirect monolithic expert tensors to CPU to avoid duplicating them on GPU.
+            // The TP shard tensors on each device are the ones used for compute;
+            // the monolithic tensors are only needed temporarily for loading GGUF data.
+            if (tp && (tn_tensor == LLM_TENSOR_FFN_GATE_EXPS ||
+                       tn_tensor == LLM_TENSOR_FFN_DOWN_EXPS ||
+                       tn_tensor == LLM_TENSOR_FFN_UP_EXPS)) {
+                auto cpu_buft = select_weight_buft(hparams, t_meta, op, pimpl->cpu_buft_list);
+                if (cpu_buft) {
+                    buft = cpu_buft;
+                }
+            }
+
             // avoid using a host buffer when using mmap
             auto * buft_dev = ggml_backend_buft_get_device(buft);
             if (ml.use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
