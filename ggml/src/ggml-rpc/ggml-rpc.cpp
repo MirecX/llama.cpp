@@ -1628,22 +1628,24 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             return false;
         }
     }
-    // Debug: dump graph nodes before compute
+    // Debug: log MUL_MAT_ID details for every graph
     {
         static int graph_compute_count = 0;
-        if (graph_compute_count < 10) {
-            fprintf(stderr, "RPC-SERVER-COMPUTE[%d]: device=%u n_nodes=%d\n", graph_compute_count, device, graph->n_nodes);
-            for (int i = 0; i < graph->n_nodes && i < 20; i++) {
-                auto * node = graph->nodes[i];
-                if (!node) continue;
-                fprintf(stderr, "  [%d] '%s' op=%s data=%p buffer=%p", i, node->name, ggml_op_name(node->op), node->data, (void*)node->buffer);
-                for (int s = 0; s < GGML_MAX_SRC && node->src[s]; s++) {
-                    fprintf(stderr, " src[%d]='%s' data=%p", s, node->src[s]->name, node->src[s]->data);
-                }
-                fprintf(stderr, "\n");
-            }
-            graph_compute_count++;
+        for (int i = 0; i < graph->n_nodes; i++) {
+            auto * node = graph->nodes[i];
+            if (!node || node->op != GGML_OP_MUL_MAT_ID) continue;
+            auto * src0 = node->src[0]; // weight shard
+            auto * src1 = node->src[1]; // activations
+            auto * ids  = node->src[2]; // expert IDs
+            fprintf(stderr, "RPC-MMID[%d] '%s': src0=[%lld,%lld,%lld] data=%p, src1=[%lld,%lld,%lld] data=%p nb=[%zu,%zu,%zu], ids=[%lld,%lld] data=%p, dst=[%lld,%lld,%lld] data=%p\n",
+                    graph_compute_count, node->name,
+                    (long long)src0->ne[0], (long long)src0->ne[1], (long long)src0->ne[2], src0->data,
+                    (long long)src1->ne[0], (long long)src1->ne[1], (long long)src1->ne[2], src1->data,
+                    src1->nb[0], src1->nb[1], src1->nb[2],
+                    (long long)ids->ne[0], (long long)ids->ne[1], ids->data,
+                    (long long)node->ne[0], (long long)node->ne[1], (long long)node->ne[2], node->data);
         }
+        graph_compute_count++;
     }
     // Safety check: skip graphs containing nodes with nil data pointers.
     // These are leaked scheduler splits (e.g., conv_states with Vulkan buffers)
@@ -1689,8 +1691,16 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             return true;
         }
     }
-    ggml_status status = ggml_backend_graph_compute(backends[device], graph);
-    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    {
+        // Use the same gc from the nil-data check (declared earlier in this function)
+        // But we need our own counter here since gc is in a different scope
+        static int compute_gc = 0;
+        fprintf(stderr, "RPC-SERVER: computing graph[%d] n_nodes=%d\n", compute_gc, graph->n_nodes);
+        ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+        fprintf(stderr, "RPC-SERVER: graph[%d] compute %s\n", compute_gc, status == GGML_STATUS_SUCCESS ? "OK" : "FAILED");
+        compute_gc++;
+        GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    }
     stored_graphs[device].ctx_ptr.swap(ctx_ptr);
     stored_graphs[device].graph = graph;
     return true;
