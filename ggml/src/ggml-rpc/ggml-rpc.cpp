@@ -1645,6 +1645,11 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             graph_compute_count++;
         }
     }
+    // Debug: log per-graph status
+    {
+        static int gc = 0;
+        fprintf(stderr, "RPC-SERVER: about to compute graph[%d] device=%u n_nodes=%d\n", gc++, device, graph->n_nodes);
+    }
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     stored_graphs[device].ctx_ptr.swap(ctx_ptr);
