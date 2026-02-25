@@ -642,11 +642,6 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
         result.buffer = ctx != nullptr ? ctx->remote_ptr : 0;
     } else {
         result.buffer = 0;
-        // DEBUG: warn about tensors with non-RPC buffers being serialized
-        if (tensor->data && tensor->op != GGML_OP_NONE) {
-            fprintf(stderr, "RPC-SERIALIZE WARNING: tensor '%s' op=%s has no RPC buffer! data=%p buffer=%p\n",
-                    tensor->name, ggml_op_name(tensor->op), tensor->data, (void*)tensor->buffer);
-        }
     }
     for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
         result.ne[i] = tensor->ne[i];
@@ -662,7 +657,19 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
     }
     result.view_src = reinterpret_cast<uint64_t>(tensor->view_src);
     result.view_offs = tensor->view_offs;
-    result.data = reinterpret_cast<uint64_t>(tensor->data);
+    // Zero data pointer for non-RPC buffer tensors to prevent the server from
+    // interpreting local device pointers (e.g. Vulkan) as CUDA pointers.
+    if (tensor->buffer && !ggml_backend_buffer_is_rpc(tensor->buffer)) {
+        static int zero_warn_count = 0;
+        if (zero_warn_count < 20) {
+            fprintf(stderr, "RPC-SERIALIZE: zeroing data ptr for non-RPC tensor '%s' op=%s data=%p\n",
+                    tensor->name, ggml_op_name(tensor->op), tensor->data);
+            zero_warn_count++;
+        }
+        result.data = 0;
+    } else {
+        result.data = reinterpret_cast<uint64_t>(tensor->data);
+    }
 
     // Avoid sending uninitialized data over the wire
     memset(result.name, 0, sizeof(result.name));
