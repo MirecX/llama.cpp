@@ -1816,26 +1816,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn_tp(
 
     ggml_tensor * device_results[2] = {};
 
+    // slot index for unique non-local expert ID assignment
+    // [0, 1, ..., n_expert_used-1] — broadcast across tokens via ggml_repeat
+    ggml_tensor * slot_idx_1d = ggml_arange(ctx0, 0.0f, (float)n_expert_used, 1.0f); // [n_expert_used]
+    ggml_backend_sched_set_tensor_backend(sched, slot_idx_1d, primary_backend);
+    ggml_tensor * slot_idx = ggml_repeat(ctx0, slot_idx_1d, sel_f); // [n_expert_used, n_tokens]
+    ggml_backend_sched_set_tensor_backend(sched, slot_idx, primary_backend);
+
     for (int d = 0; d < 2; d++) {
         const int64_t nd       = n_expert_split[d];
         const int64_t id_start = (d == 0) ? 0  : n0;  // global ID range start
         const int64_t id_end   = (d == 0) ? n0 : n_expert; // global ID range end (exclusive)
 
-        // remap expert IDs: subtract base, clamp to [0, nd-1]
-        // experts not on this device get clamped to 0 (but their weight will be 0)
-        // pin ALL intermediates to primary device
-        ggml_tensor * id_offset = ggml_fill(ctx0, sel_f, -(float)id_start);
-        ggml_backend_sched_set_tensor_backend(sched, id_offset, primary_backend);
-        ggml_tensor * local_ids_f = ggml_add(ctx0, sel_f, id_offset);
-        ggml_backend_sched_set_tensor_backend(sched, local_ids_f, primary_backend);
-        local_ids_f = ggml_clamp(ctx0, local_ids_f, 0.0f, (float)(nd - 1));
-        ggml_backend_sched_set_tensor_backend(sched, local_ids_f, primary_backend);
-        ggml_tensor * local_ids = ggml_cast(ctx0, local_ids_f, GGML_TYPE_I32);
-        ggml_format_name(local_ids, "ffn_moe_local_ids_%d", d);
-        ggml_backend_sched_set_tensor_backend(sched, local_ids, primary_backend);
-
         // create weight mask: zero out weights for experts not on this device
-        // mask[i] = (selected_experts[i] >= id_start && selected_experts[i] < id_end) ? 1.0 : 0.0
+        // mask_2d[i] = (selected_experts[i] >= id_start && selected_experts[i] < id_end) ? 1.0 : 0.0
         // pin ALL intermediates to prevent scheduler expansion leaking
         ggml_tensor * fill_start = ggml_fill(ctx0, sel_f, -(float)id_start + 0.5f);
         ggml_backend_sched_set_tensor_backend(sched, fill_start, primary_backend);
@@ -1853,9 +1847,39 @@ ggml_tensor * llm_graph_context::build_moe_ffn_tp(
         ggml_tensor * below_end = ggml_step(ctx0, shifted_end);
         ggml_backend_sched_set_tensor_backend(sched, below_end, primary_backend);
 
-        ggml_tensor * mask = ggml_mul(ctx0, above_start, below_end); // [n_expert_used, n_tokens]
-        ggml_backend_sched_set_tensor_backend(sched, mask, primary_backend);
-        mask = ggml_reshape_3d(ctx0, mask, 1, n_expert_used, n_tokens);
+        ggml_tensor * mask_2d = ggml_mul(ctx0, above_start, below_end); // [n_expert_used, n_tokens]
+        ggml_backend_sched_set_tensor_backend(sched, mask_2d, primary_backend);
+        ggml_format_name(mask_2d, "ffn_moe_mask2d_%d", d);
+
+        // remap expert IDs: for LOCAL experts use (selected - id_start),
+        // for NON-LOCAL experts use slot_index (0..n_expert_used-1) as unique dummy IDs.
+        // This avoids duplicate IDs that break CUDA mm_ids_helper's uniqueness assumption.
+        // Formula: local_ids = mask * (sel - id_start) + (1 - mask) * slot_index
+        ggml_tensor * id_offset = ggml_fill(ctx0, sel_f, -(float)id_start);
+        ggml_backend_sched_set_tensor_backend(sched, id_offset, primary_backend);
+        ggml_tensor * local_ids_raw = ggml_add(ctx0, sel_f, id_offset); // correct for local, garbage for non-local
+        ggml_backend_sched_set_tensor_backend(sched, local_ids_raw, primary_backend);
+
+        // mask * local_ids_raw: keeps correct IDs for local experts, zeros non-local
+        ggml_tensor * local_part = ggml_mul(ctx0, mask_2d, local_ids_raw);
+        ggml_backend_sched_set_tensor_backend(sched, local_part, primary_backend);
+
+        // (1 - mask) * slot_index: unique dummy IDs for non-local experts, zero for local
+        ggml_tensor * inv_mask = ggml_fill(ctx0, sel_f, 1.0f);
+        ggml_backend_sched_set_tensor_backend(sched, inv_mask, primary_backend);
+        inv_mask = ggml_sub(ctx0, inv_mask, mask_2d);
+        ggml_backend_sched_set_tensor_backend(sched, inv_mask, primary_backend);
+        ggml_tensor * dummy_part = ggml_mul(ctx0, inv_mask, slot_idx);
+        ggml_backend_sched_set_tensor_backend(sched, dummy_part, primary_backend);
+
+        ggml_tensor * local_ids_f = ggml_add(ctx0, local_part, dummy_part);
+        ggml_backend_sched_set_tensor_backend(sched, local_ids_f, primary_backend);
+        ggml_tensor * local_ids = ggml_cast(ctx0, local_ids_f, GGML_TYPE_I32);
+        ggml_format_name(local_ids, "ffn_moe_local_ids_%d", d);
+        ggml_backend_sched_set_tensor_backend(sched, local_ids, primary_backend);
+
+        // reshape mask for weight multiplication: [1, n_expert_used, n_tokens]
+        ggml_tensor * mask = ggml_reshape_3d(ctx0, mask_2d, 1, n_expert_used, n_tokens);
         ggml_backend_sched_set_tensor_backend(sched, mask, primary_backend);
         ggml_format_name(mask, "ffn_moe_mask_%d", d);
 
