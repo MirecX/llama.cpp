@@ -513,21 +513,13 @@ ggml_tensor * llm_build_qwen35moe ::build_layer_ffn(ggml_tensor * cur, const int
     if (model.layers[il].ffn_up_shexp != nullptr) {
         ggml_tensor * ffn_shexp;
 
-        if (tp) {
-            // TP path: column/row parallel shared expert FFN
-            ffn_shexp = build_ffn_tp(cur,
-                model.layers[il].ffn_up_shexp,
-                model.layers[il].ffn_gate_shexp,
-                model.layers[il].ffn_down_shexp,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
-        } else {
-            ffn_shexp = build_ffn(cur,
-                model.layers[il].ffn_up_shexp, NULL, NULL,
-                model.layers[il].ffn_gate_shexp, NULL, NULL,
-                model.layers[il].ffn_down_shexp, NULL, NULL,
-                NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
-        }
+        // shared experts always run on primary device (no TP split for v1)
+        ffn_shexp = build_ffn(cur,
+            model.layers[il].ffn_up_shexp, NULL, NULL,
+            model.layers[il].ffn_gate_shexp, NULL, NULL,
+            model.layers[il].ffn_down_shexp, NULL, NULL,
+            NULL,
+            LLM_FFN_SILU, LLM_FFN_PAR, il);
         cb(ffn_shexp, "ffn_shexp", il);
 
         // Apply shared expert gating as in the reference implementation
