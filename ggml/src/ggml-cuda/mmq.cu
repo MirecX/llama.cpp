@@ -179,6 +179,46 @@ void ggml_cuda_mul_mat_q(
         CUDA_CHECK(cudaGetLastError());
     }
 
+    // DEBUG: validate ids_src1 and expert_bounds
+    {
+        static int mmq_id_count = 0;
+        if (mmq_id_count < 200) {
+            const int64_t sis1 = nb12 / nb11;
+            const int64_t max_valid = (ne12 - 1) * sis1 + (ne11 - 1); // max valid ids_src1 value
+            std::vector<int32_t> h_ids(ne_get_rows);
+            std::vector<int32_t> h_bounds(ne02 + 1);
+            CUDA_CHECK(cudaMemcpy(h_ids.data(), ids_src1.get(), ne_get_rows * sizeof(int32_t), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(h_bounds.data(), expert_bounds.get(), (ne02 + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost));
+
+            bool bad = false;
+            for (int64_t i = 0; i < ne_get_rows; i++) {
+                if (h_ids[i] < 0 || h_ids[i] > max_valid) {
+                    fprintf(stderr, "MMQ-VALIDATE[%d] ids_src1[%lld]=%d OUT OF RANGE (max=%lld) ne12=%lld sis1=%lld ne11=%lld\n",
+                            mmq_id_count, (long long)i, h_ids[i], (long long)max_valid, (long long)ne12, (long long)sis1, (long long)ne11);
+                    bad = true;
+                    if (i > 5) break;
+                }
+            }
+            if (h_bounds[ne02] != ne_get_rows) {
+                fprintf(stderr, "MMQ-VALIDATE[%d] expert_bounds[%lld]=%d != ne_get_rows=%lld\n",
+                        mmq_id_count, (long long)ne02, h_bounds[ne02], (long long)ne_get_rows);
+                bad = true;
+            }
+            if (bad) {
+                // Also dump expert ids
+                std::vector<int32_t> h_expert_ids(ids->ne[0] * ids->ne[1]);
+                CUDA_CHECK(cudaMemcpy(h_expert_ids.data(), ids->data, h_expert_ids.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+                fprintf(stderr, "  expert_ids (first 16): ");
+                for (size_t i = 0; i < std::min(h_expert_ids.size(), (size_t)16); i++) {
+                    fprintf(stderr, "%d ", h_expert_ids[i]);
+                }
+                fprintf(stderr, "\n  ne02=%lld ne12=%lld n_expert_used=%lld ne10=%lld src1_bytes=%lld\n",
+                        (long long)ne02, (long long)ne12, (long long)n_expert_used, (long long)ne10, (long long)ggml_nbytes(src1));
+            }
+            mmq_id_count++;
+        }
+    }
+
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * sizeof(block_q8_1)/QK8_1 +
         get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
