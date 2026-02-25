@@ -340,27 +340,41 @@ ggml_tensor * llm_build_qwen35moe ::build_layer_attn_linear(
     GGML_ASSERT(ubatch.equal_seqs());
     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
 
+    // Helper: pin tensor to primary device when TP is active.
+    // This prevents scheduler pass 5 from absorbing linear attention ops into RPC splits.
+    auto pin_primary = [&](ggml_tensor * t) {
+        if (tp && t) { ggml_backend_sched_set_tensor_backend(sched, t, get_tp_backend(0)); }
+    };
+
     // Input projections
     auto qkvz = build_qkvz(cur, il);
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
+    pin_primary(qkv_mixed);
+    pin_primary(z);
 
     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur);
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
+    pin_primary(beta);
 
     beta = ggml_sigmoid(ctx0, beta);
+    pin_primary(beta);
 
     ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur);
     alpha = ggml_cont_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
+    pin_primary(alpha);
 
     ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
+    pin_primary(alpha_biased);
     ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
     cb(alpha_softplus, "a_softplus", il);
+    pin_primary(alpha_softplus);
 
     ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
     cb(gate, "gate", il);
+    pin_primary(gate);
 
     gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
 
@@ -420,6 +434,7 @@ ggml_tensor * llm_build_qwen35moe ::build_layer_attn_linear(
 
     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
     cb(conv_output_silu, "conv_output_silu", il);
+    pin_primary(conv_output_silu);
 
     ggml_tensor * conv_qkv_mix = conv_output_silu;
 
@@ -453,7 +468,9 @@ ggml_tensor * llm_build_qwen35moe ::build_layer_attn_linear(
     const float eps_norm = hparams.f_norm_rms_eps;
 
     q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
+    pin_primary(q_conv);
     k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+    pin_primary(k_conv);
 
     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
@@ -464,7 +481,9 @@ ggml_tensor * llm_build_qwen35moe ::build_layer_attn_linear(
         GGML_ASSERT(num_v_heads % num_k_heads == 0);
         // TODO: try to avoid these explicit repeats by utilizing op broadcast
         q_conv = ggml_repeat_4d(ctx0, q_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
+        pin_primary(q_conv);
         k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
+        pin_primary(k_conv);
     }
 
     cb(q_conv, "q_conv_predelta", il);
@@ -482,6 +501,8 @@ ggml_tensor * llm_build_qwen35moe ::build_layer_attn_linear(
     ggml_tensor * new_state = attn_out.second;
     cb(output, "attn_output", il);
     cb(new_state, "new_state", il);
+    pin_primary(output);
+    pin_primary(new_state);
 
     // Update the recurrent states
     {
@@ -497,6 +518,7 @@ ggml_tensor * llm_build_qwen35moe ::build_layer_attn_linear(
 
     // Apply gated normalization: self.norm(core_attn_out, z)
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
+    pin_primary(attn_out_norm);
 
     // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_tokens, n_seqs, n_heads * head_dim]
     ggml_tensor * final_output = ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);

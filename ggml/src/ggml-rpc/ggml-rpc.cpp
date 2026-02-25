@@ -1645,10 +1645,49 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             graph_compute_count++;
         }
     }
-    // Debug: log per-graph status
+    // Safety check: skip graphs containing nodes with nil data pointers.
+    // These are leaked scheduler splits (e.g., conv_states with Vulkan buffers)
+    // that should never be computed on the RPC device. Computing them would
+    // cause CUDA to write to address 0, corrupting memory.
     {
         static int gc = 0;
-        fprintf(stderr, "RPC-SERVER: about to compute graph[%d] device=%u n_nodes=%d\n", gc++, device, graph->n_nodes);
+        bool has_nil_data = false;
+        for (int i = 0; i < graph->n_nodes; i++) {
+            auto * node = graph->nodes[i];
+            if (!node || node->op == GGML_OP_NONE) continue;
+
+            // Check node output data
+            if (!node->data) {
+                fprintf(stderr, "RPC-SERVER: graph[%d] node[%d] '%s' op=%s has nil data, SKIPPING graph\n",
+                        gc, i, node->name, ggml_op_name(node->op));
+                has_nil_data = true;
+                break;
+            }
+
+            // Check source tensor data (inputs to this op)
+            for (int s = 0; s < GGML_MAX_SRC && node->src[s]; s++) {
+                auto * src = node->src[s];
+                // Walk view chain to find actual data
+                auto * base = src;
+                while (base->view_src) base = base->view_src;
+                if (!base->data && base->op == GGML_OP_NONE) {
+                    // Weight/input tensor with no data — leaked from client
+                    fprintf(stderr, "RPC-SERVER: graph[%d] node[%d] '%s' src[%d]='%s' (base='%s') has nil data, SKIPPING graph\n",
+                            gc, i, node->name, s, src->name, base->name);
+                    has_nil_data = true;
+                    break;
+                }
+            }
+            if (has_nil_data) break;
+        }
+        gc++;
+        if (has_nil_data) {
+            fprintf(stderr, "RPC-SERVER: skipping graph with nil-data tensors to prevent memory corruption\n");
+            // Still store graph context to prevent dangling pointers
+            stored_graphs[device].ctx_ptr.swap(ctx_ptr);
+            stored_graphs[device].graph = graph;
+            return true;
+        }
     }
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
