@@ -55,6 +55,18 @@ llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_gr
         ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
         cb(attn_post_norm, "attn_post_norm", il);
 
+        // When TP is active, pin attention/residual/norm ops to primary device.
+        // This prevents the scheduler from absorbing attention-related view ops
+        // (e.g., conv_states RESHAPE/VIEW) into RPC splits via pass 5 expansion.
+        // View ops don't get their own split boundaries in the scheduler, so without
+        // these pins, state cache ops with Vulkan buffers can end up in RPC splits.
+        if (tp) {
+            ggml_backend_t primary = get_tp_backend(0);
+            ggml_backend_sched_set_tensor_backend(sched, cur, primary);
+            ggml_backend_sched_set_tensor_backend(sched, ffn_residual, primary);
+            ggml_backend_sched_set_tensor_backend(sched, attn_post_norm, primary);
+        }
+
         // MOE FFN layer
         cur = build_layer_ffn(attn_post_norm, il);
         cb(cur, "ffn_out", il);
@@ -62,6 +74,11 @@ llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_gr
         // Residual connection for FFN - add to the tensor from before post_attention_layernorm
         cur = ggml_add(ctx0, cur, ffn_residual);
         cb(cur, "post_moe", il);
+
+        // When TP active, pin final residual to primary
+        if (tp) {
+            ggml_backend_sched_set_tensor_backend(sched, cur, get_tp_backend(0));
+        }
 
         // Input for next layer
         inpL = cur;
@@ -354,6 +371,11 @@ ggml_tensor * llm_build_qwen35moe ::build_layer_attn_linear(
     // Build the convolution states tensor
     ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
     cb(conv_states, "conv_states", il);
+    // When TP is active, pin state cache ops to primary device to prevent
+    // scheduler expansion from leaking RPC assignment to state tensors
+    if (tp) {
+        ggml_backend_sched_set_tensor_backend(sched, conv_states, get_tp_backend(0));
+    }
 
     // Calculate convolution kernel size
     ggml_tensor * conv_kernel      = model.layers[il].ssm_conv1d;
@@ -368,6 +390,7 @@ ggml_tensor * llm_build_qwen35moe ::build_layer_attn_linear(
 
     ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
     cb(conv_input, "conv_input", il);
+    if (tp) { ggml_backend_sched_set_tensor_backend(sched, conv_input, get_tp_backend(0)); }
 
     // Update convolution state cache
     // Extract the last (conv_kernel_size - 1) states from conv_input
@@ -381,15 +404,19 @@ ggml_tensor * llm_build_qwen35moe ::build_layer_attn_linear(
                      kv_head * (conv_kernel_size - 1) * conv_channels * ggml_element_size(conv_states_all));
     cb(state_update_target, "state_update_target", il);
 
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_conv_states, state_update_target));
+    ggml_tensor * conv_cpy = ggml_cpy(ctx0, last_conv_states, state_update_target);
+    if (tp) { ggml_backend_sched_set_tensor_backend(sched, conv_cpy, get_tp_backend(0)); }
+    ggml_build_forward_expand(gf, conv_cpy);
     cb(conv_states_all, "conv_states_updated", il);
 
     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    if (tp) { ggml_backend_sched_set_tensor_backend(sched, state, get_tp_backend(0)); }
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);
+    if (tp) { ggml_backend_sched_set_tensor_backend(sched, conv_output_proper, get_tp_backend(0)); }
 
     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
     cb(conv_output_silu, "conv_output_silu", il);
@@ -457,10 +484,13 @@ ggml_tensor * llm_build_qwen35moe ::build_layer_attn_linear(
     cb(new_state, "new_state", il);
 
     // Update the recurrent states
-    ggml_build_forward_expand(gf,
-            ggml_cpy(ctx0, new_state,
+    {
+        ggml_tensor * ssm_cpy = ggml_cpy(ctx0, new_state,
                 ggml_view_1d(ctx0, ssm_states_all, hparams.n_embd_s() * n_seqs,
-                    kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+                    kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all)));
+        if (tp) { ggml_backend_sched_set_tensor_backend(sched, ssm_cpy, get_tp_backend(0)); }
+        ggml_build_forward_expand(gf, ssm_cpy);
+    }
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
@@ -475,6 +505,7 @@ ggml_tensor * llm_build_qwen35moe ::build_layer_attn_linear(
     // Output projection
     cur = build_lora_mm(model.layers[il].ssm_out, final_output);
     cb(cur, "linear_attn_out", il);
+    if (tp) { ggml_backend_sched_set_tensor_backend(sched, cur, get_tp_backend(0)); }
 
     // Reshape back to original dimensions
     cur = ggml_reshape_2d(ctx0, cur, n_embd, n_seq_tokens * n_seqs);
